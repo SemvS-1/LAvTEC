@@ -1,4 +1,4 @@
-def plot_dataset(ds):
+def plot_dataset(ds, H=350):
 
     name = ds["name"]
     time = ds["time"]
@@ -11,7 +11,7 @@ def plot_dataset(ds):
     B_ref = ds["B_ref"]
 
     # --- find 350 km index ---
-    h_idx = np.argmin(np.abs(heights - 350))
+    h_idx = np.argmin(np.abs(heights - H))
     print(f"{name}: using height = {heights[h_idx]:.1f} km")
 
     # --- compute dB ---
@@ -55,5 +55,7 @@ def plot_dataset(ds):
     make_plot(T1dB_h, "T1 × dB", "T1 * dB")
     make_plot(T2dB_h, "T2 × dB", "T2 * dB")
 
+Height = 350
+
 for ds in datasets:
-    plot_dataset(ds)
+    plot_dataset(ds, Height)
