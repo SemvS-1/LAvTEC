@@ -1,0 +1,201 @@
+import numpy as np
+import h5py
+import matplotlib.pyplot as plt
+
+from pathlib import Path
+from scipy.ndimage import median_filter
+from scipy.interpolate import interp1d
+
+from losoto.h5parm import h5parm
+from astropy.time import Time
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def as_str_list(arr):
+    return [x.decode() if isinstance(x, bytes) else str(x) for x in arr]
+
+
+def clean_timeseries(data, time, interp_to=None, filt_size=5):
+    """Remove spikes, clip outliers, optionally interpolate"""
+    data = np.where(data == 0, np.nan, data)
+    data = median_filter(data, size=(1, filt_size))
+
+    thresh = np.nanpercentile(np.abs(data), 99)
+    data = np.clip(data, -thresh, thresh)
+
+    if interp_to is None:
+        return data
+
+    out = np.full((data.shape[0], len(interp_to)), np.nan)
+
+    for i in range(data.shape[0]):
+        mask = np.isfinite(data[i])
+        if np.sum(mask) > 5:
+            f = interp1d(
+                time[mask], data[i, mask],
+                bounds_error=False,
+                fill_value=np.nan
+            )
+            out[i] = f(interp_to)
+
+    return out
+
+
+def solve_T(dRM, dTEC, B, am, ref_idx, C=2.620e-6, err=0.05):
+    """Solve for T1 and T2"""
+    B_ref = B[ref_idx]
+    am_ref = am[ref_idx]
+
+    nsta, ntime = dRM.shape
+    nheight = B.shape[2]
+
+    T1 = np.full((nsta, ntime, nheight), np.nan)
+    T2 = np.full_like(T1, np.nan)
+
+    for i in range(nsta):
+
+        Bi = B[i]
+        ami = am[i]
+
+        dTEC_2D = dTEC[i][:, None]
+        dRM_2D  = dRM[i][:, None]
+
+        dB = Bi - B_ref
+
+        num1 = (dRM_2D / C) - (B_ref * dTEC_2D)
+        num2 = (dRM_2D / C) - (Bi * dTEC_2D)
+
+        denom1 = ami * dB
+        denom2 = am_ref * dB
+
+        eps = err * np.nanmedian(np.abs(denom1))
+
+        valid1 = (
+            np.isfinite(num1) &
+            np.isfinite(denom1) &
+            (np.abs(denom1) > eps)
+        )
+
+        valid2 = (
+            np.isfinite(num2) &
+            np.isfinite(denom2) &
+            (np.abs(denom2) > eps)
+        )
+
+        T1[i][valid1] = num1[valid1] / denom1[valid1]
+        T2[i][valid2] = num2[valid2] / denom2[valid2]
+
+    return T1, T2, B_ref, am_ref
+
+
+# =========================================================
+# MAIN PIPELINE
+# =========================================================
+
+def run_pipeline(geom_file, rm_file, tec_file,
+                 tec_is_npz=False,
+                 ref_rm="CS002LBA",
+                 ref_tec=None, Err=None):
+
+    # ---------------- GEOMETRY ----------------
+    with h5py.File(geom_file, "r") as f:
+        stations = as_str_list(f["stations"][:])
+        am = f["airmass"][:]
+        B = -f["b_parallel"][:]
+        heights = f["heights_km"][:]
+
+    idx = {s: i for i, s in enumerate(stations)}
+
+    # ---------------- RM ----------------
+    h5_rm = h5parm(str(rm_file), readonly=True)
+    vals_rm, axes_rm = h5_rm.getSolset("sol000") \
+                           .getSoltab("rotationmeasure000") \
+                           .getValues(weight=False)
+
+    ants_rm = as_str_list(axes_rm["ant"])
+    time_rm = np.squeeze(axes_rm["time"])
+    time_hr = (time_rm - time_rm.min()) / 3600
+
+    vals_rm = np.squeeze(vals_rm)
+
+    # --- RM reference ---
+    ref_idx_rm = ants_rm.index(ref_rm)
+    dRM = vals_rm - vals_rm[ref_idx_rm]
+
+    dRM = clean_timeseries(dRM, time_hr)
+
+    # ---------------- TEC ----------------
+    if tec_is_npz:
+        data = np.load(tec_file)
+
+        ants_tec = as_str_list(data["stations"])
+        vals_tec = data["tec"]
+
+        time_tec = Time(data["times"][1:], format="mjd")
+        time_tec_hr = (time_tec.mjd - time_tec.mjd.min()) / 3600
+
+    else:
+        h5_tec = h5parm(str(tec_file), readonly=True)
+        vals_tec, axes_tec = h5_tec.getSolset("sol000") \
+                                  .getSoltab("tec000") \
+                                  .getValues(weight=False)
+
+        ants_tec = as_str_list(axes_tec["ant"])
+        time_tec = np.squeeze(axes_tec["time"])
+        time_tec_hr = (time_tec - time_tec.min()) / 3600
+
+    vals_tec = np.squeeze(vals_tec)
+
+    if vals_tec.shape[0] != len(ants_tec):
+        vals_tec = vals_tec.T
+
+    # --- TEC reference handling ---
+    if ref_tec is None:
+        ref_tec = ref_rm
+
+    if ref_tec not in ants_tec:
+        raise ValueError(f"{ref_tec} not found in TEC stations")
+
+    # Step 1: compute TEC relative to its own reference
+    ref_idx_tec = ants_tec.index(ref_tec)
+    dTEC = vals_tec - vals_tec[ref_idx_tec]
+
+    # --- TEC reference handling ---
+    if ref_tec is None:
+        ref_tec = ref_rm
+
+    if ref_tec not in ants_tec:
+        raise ValueError(f"{ref_tec} not found in TEC stations")
+
+    ref_idx_tec = ants_tec.index(ref_tec)
+    dTEC = vals_tec - vals_tec[ref_idx_tec]
+
+    # NOTE:
+    # We intentionally do NOT force TEC to match RM reference,
+    # because ref_rm may not exist in TEC (e.g. CS002LBA vs SuperSt).
+
+    # --- CLEAN + INTERPOLATE ---
+    dTEC = clean_timeseries(dTEC, time_tec_hr, interp_to=time_hr)
+
+        # ---------------- COMMON STATIONS ----------------
+    common = [s for s in stations if s in ants_rm and s in ants_tec]
+
+    dRM_c = np.array([dRM[ants_rm.index(s)] for s in common])
+    dTEC_c = np.array([dTEC[ants_tec.index(s)] for s in common])
+
+    geom_idx = np.array([idx[s] for s in common])
+
+    # ---------------- SOLVE ----------------
+    T1, T2, B_ref, am_ref = solve_T(
+        dRM_c,
+        dTEC_c,
+        B[geom_idx],
+        am[geom_idx],
+        ref_idx=idx[ref_rm],
+        err=Err
+    )
+
+    return T1, T2, time_hr, heights, common, B, am, dTEC_c, dRM_c, B_ref, am_ref
