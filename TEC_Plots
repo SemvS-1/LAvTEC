@@ -1,0 +1,59 @@
+def plot_dataset(ds):
+
+    name = ds["name"]
+    time = ds["time"]
+    heights = ds["heights"]
+    stations = ds["stations"]
+
+    T1 = ds["T1"]
+    T2 = ds["T2"]
+    B = ds["B"]
+    B_ref = ds["B_ref"]
+
+    # --- find 350 km index ---
+    h_idx = np.argmin(np.abs(heights - 350))
+    print(f"{name}: using height = {heights[h_idx]:.1f} km")
+
+    # --- compute dB ---
+
+    dB = B - B_ref[None, :, :]   # (nsta, ntime, nheight)
+
+    # --- extract slices ---
+    T1_h = T1[:, :, h_idx]
+    T2_h = T2[:, :, h_idx]
+
+    T1dB_h = (T1 * dB)[:, :, h_idx]
+    T2dB_h = (T2 * dB)[:, :, h_idx]
+
+    # =====================================================
+    # PLOTTING
+    # =====================================================
+
+    def make_plot(data, title, ylabel):
+        plt.figure(figsize=(10, 6))
+
+        for i, sta in enumerate(stations):
+            plt.plot(time, data[i], label=sta, alpha=0.7)
+
+        plt.title(f"{name} — {title} @ {heights[h_idx]:.0f} km")
+        plt.xlabel("Time [hr]")
+        plt.ylabel(ylabel)
+
+        # avoid overcrowded legend
+        if len(stations) <= 10:
+            plt.legend()
+        else:
+            plt.legend(fontsize=6, ncol=2)
+
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+    # --- plots ---
+    make_plot(T1_h, "T1", "T1")
+    make_plot(T2_h, "T2", "T2")
+    make_plot(T1dB_h, "T1 × dB", "T1 * dB")
+    make_plot(T2dB_h, "T2 × dB", "T2 * dB")
+
+for ds in datasets:
+    plot_dataset(ds)
