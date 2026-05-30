@@ -198,4 +198,4 @@ def run_pipeline(geom_file, rm_file, tec_file,
         err=Err
     )
 
-    return T1, T2, time_hr, heights, common, B, am, dTEC_c, dRM_c, B_ref, am_ref
+    return T1, T2, time_hr, heights, common, B[geom_idx], am[geom_idx], dTEC_c, dRM_c, B_ref, am_ref
