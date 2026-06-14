@@ -1,0 +1,675 @@
+import numpy as np
+import h5py
+import matplotlib.pyplot as plt
+
+from pathlib import Path
+from scipy.interpolate import interp1d
+
+from losoto.h5parm import h5parm
+from astropy.time import Time
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def as_str_list(arr):
+    """
+    Convert an array of byte strings or objects to a plain Python list of str.
+
+    HDF5 and h5parm often return station names as byte strings (b'CS002LBA').
+    This ensures everything downstream works with regular Python strings.
+
+    Parameters
+    ----------
+    arr : array-like
+        Array of bytes or str objects.
+
+    Returns
+    -------
+    list of str
+    """
+    
+    return [x.decode() if isinstance(x, bytes) else str(x) for x in arr]
+
+
+def interpolate_to_grid(data, time, target_time, max_gap_hr=0.05):
+    """
+    Interpolate each row of `data` onto `target_time`, but refuse to
+    fill across NaN gaps wider than `max_gap_hr` hours.
+
+    This is used to resample calibration solutions onto a uniform time grid
+    without inventing data across flagged or missing intervals.
+
+    Parameters
+    ----------
+    data : (n_stations, n_time_in) ndarray
+        Input data, may contain NaNs for flagged samples.
+    time : (n_time_in,) ndarray
+        Time axis of `data` in hours.
+    target_time : (n_time_out,) ndarray
+        Desired output time axis in hours.
+    max_gap_hr : float
+        Maximum allowed distance (hours) between a target point and the
+        nearest valid input sample. Points further away are set to NaN.
+
+    Returns
+    -------
+    out : (n_stations, n_time_out) ndarray
+        Interpolated data; NaN where data was missing or gap too large.
+    """
+
+    out = np.full((data.shape[0], len(target_time)), np.nan)
+    for i in range(data.shape[0]):
+        row = data[i].copy()
+        mask = np.isfinite(row)
+        if np.sum(mask) < 2:
+            continue
+        f = interp1d(time[mask], row[mask], bounds_error=False, fill_value=np.nan)
+        interpolated = f(target_time)
+        for j, t in enumerate(target_time):
+            dists = np.abs(time[mask] - t)
+            if dists.min() > max_gap_hr:
+                interpolated[j] = np.nan
+        out[i] = interpolated
+    return out
+
+
+def align_tec_to_rm(dTEC, time_tec_hr, time_hr):
+    """
+    Resample dTEC from its own time grid onto the RM time grid using
+    nearest-neighbour matching.
+
+    The TEC and RM solutions are typically measured on different cadences.
+    This maps each RM time step to the closest TEC time step so both arrays
+    share the same time axis before entering solve_T.
+
+    Parameters
+    ----------
+    dTEC : (n_stations, n_time_tec) ndarray
+        Differential TEC (station minus reference) on the TEC time grid.
+    time_tec_hr : (n_time_tec,) ndarray
+        TEC time axis in hours (relative to its own start).
+    time_hr : (n_time_rm,) ndarray
+        RM time axis in hours (relative to its own start).
+
+    Returns
+    -------
+    (n_stations, n_time_rm) ndarray
+        dTEC resampled onto the RM time grid.
+    """
+
+    idx = np.argmin(np.abs(time_tec_hr[:, np.newaxis] - time_hr[np.newaxis, :]), axis=0)
+    idx = np.clip(idx, 0, dTEC.shape[1] - 1)
+    return dTEC[:, idx]
+
+
+def mask_spikes(dRM, threshold_factor=3.0, window=20):
+    """
+    Flag short-duration spikes in differential RM time series by comparing
+    each sample to a smoothed trend and masking outliers.
+
+    A running mean (uniform filter) is subtracted to get residuals, then
+    samples exceeding `threshold_factor` * std(residuals) are set to NaN.
+    This is applied per station independently.
+
+    Parameters
+    ----------
+    dRM : (n_stations, n_time) ndarray
+        Differential rotation measure time series.
+    threshold_factor : float
+        Number of standard deviations above which a sample is called a spike.
+        Lower values mask more aggressively (default 3.0; pipeline uses 1.5).
+    window : int
+        Width of the uniform smoothing filter in samples.
+
+    Returns
+    -------
+    masked : (n_stations, n_time) ndarray
+        Copy of dRM with spike samples replaced by NaN.
+    """
+
+    from scipy.ndimage import uniform_filter1d
+    masked = dRM.copy()
+    for i in range(dRM.shape[0]):
+        row = masked[i].copy()
+        trend = uniform_filter1d(row, size=window, mode='nearest')
+        residual = row - trend
+        std = np.nanstd(residual)
+        is_spike = np.abs(residual) > threshold_factor * std
+        row[is_spike] = np.nan
+        masked[i] = row
+    return masked
+
+
+def solve_T(dRM, dTEC, B, am, ref_idx, C=2.620e-6, err=0.05):
+    """
+    Solve for the absolute TEC at every
+    station, time step, and height shell.
+
+    The method uses differential RM and differential TEC between each
+    station and the reference station and the the contribution of
+    the magnetic field at different heights. Two estimates are produced:
+
+        T1[i] = (dRM/C - B_ref * dTEC) / (am_i   * dB)
+        T2[i] = (dRM/C - B_i   * dTEC) / (am_ref * dB)
+
+    where dB = B_i - B_ref is the difference in line-of-sight magnetic
+    field between station i and the reference, C = 2.620e-6 rad m^2 / TECU
+    is the RM-to-TEC conversion constant, and am is the airmass factor.
+
+    Samples where the denominator is too small (near-zero dB) are masked as NaN.
+    The threshold eps is computed globally across all stations so it stays
+    physically consistent regardless of which station is chosen as reference.
+
+    Parameters
+    ----------
+    dRM : (n_stations, n_time) ndarray
+        Differential rotation measure [rad/m²], reference station = 0.
+    dTEC : (n_stations, n_time) ndarray
+        Differential TEC [TECU], reference station = 0.
+    B : (n_stations, n_time, n_heights) ndarray
+        Line-of-sight magnetic field component [T] at each height shell.
+    am : (n_stations, n_time, n_heights) ndarray
+        Airmass (geometric path-length) factor at each height shell.
+    ref_idx : int
+        Index of the reference station in the first axis of all arrays.
+    C : float
+        RM-to-TEC conversion constant (default 2.620e-6 rad m² TECU⁻¹).
+    err : float
+        Fractional threshold for the denominator: samples with
+        |denom| < err * median(|denom|) are rejected (default 0.05).
+
+    Returns
+    -------
+    T1 : (n_stations, n_time, n_heights) ndarray
+    T2 : (n_stations, n_time, n_heights) ndarray
+        Two independent T estimates (differ in which airmass is used).
+    B_ref : (n_time, n_heights) ndarray
+        Magnetic field of the reference station.
+    am_ref : (n_time, n_heights) ndarray
+        Airmass of the reference station.
+    """
+
+    B_ref  = B[ref_idx]
+    am_ref = am[ref_idx]
+    nsta, ntime = dRM.shape
+    nheight = B.shape[2]
+    T1 = np.full((nsta, ntime, nheight), np.nan)
+    T2 = np.full_like(T1, np.nan)
+
+    # compute global eps once across all stations so the threshold
+    # doesn't shift when ref_sta changes
+    all_denom1 = np.concatenate([
+        (am[i] * (B[i] - B_ref)).ravel() for i in range(nsta)
+    ])
+    eps = err * np.nanmedian(np.abs(all_denom1))
+
+    for i in range(nsta):
+        Bi      = B[i]
+        ami     = am[i]
+        dTEC_2D = dTEC[i][:, None]
+        dRM_2D  = dRM[i][:, None]
+        dB      = Bi - B_ref
+        num1    = (dRM_2D / C) - (B_ref * dTEC_2D)
+        num2    = (dRM_2D / C) - (Bi    * dTEC_2D)
+        denom1  = ami    * dB
+        denom2  = am_ref * dB
+        valid1  = np.isfinite(num1) & np.isfinite(denom1) & (np.abs(denom1) > eps)
+        valid2  = np.isfinite(num2) & np.isfinite(denom2) & (np.abs(denom2) > eps)
+        T1[i][valid1] = num1[valid1] / denom1[valid1]
+        T2[i][valid2] = num2[valid2] / denom2[valid2]
+
+    return T1, T2, B_ref, am_ref
+
+
+# =========================================================
+# PIPELINE
+# =========================================================
+
+def run_pipeline(geom_file, rm_file, tec_file,
+                 tec_is_npz=False, ref_rm=None, ref_tec=None,
+                 Err=0.05, aliases=None):
+    """
+    Full calibration pipeline: load geometry, RM, and TEC; form differentials
+    against a reference station; align time grids; and solve for T.
+
+    Steps
+    -----
+    1. Load line-of-sight magnetic field (B) and airmass from the geometry
+       HDF5 file.
+    2. Load rotation measure solutions from an h5parm file; subtract the
+       reference station to form dRM; flag spikes.
+    3. Load TEC solutions from either an h5parm or a .npz file; subtract
+       the reference station to form dTEC; resample onto the RM time grid.
+    4. Find the common set of stations across all three sources and restrict
+       all arrays to that set.
+    5. Drop time steps where all stations are NaN in either dRM or dTEC.
+    6. Call solve_T to produce T1 and T2.
+
+    Parameters
+    ----------
+    geom_file : Path or str
+        HDF5 file containing keys: 'stations', 'airmass', 'b_parallel',
+        'heights_km'. Shape of airmass and b_parallel:
+        (n_stations, n_time, n_heights).
+    rm_file : Path or str
+        h5parm file with soltab 'rotationmeasure000' inside solset 'sol000'.
+    tec_file : Path or str
+        Either an h5parm file (tec_is_npz=False) with soltab 'tec000',
+        or a .npz file (tec_is_npz=True) with keys 'stations', 'tec',
+        'times' (MJD).
+    tec_is_npz : bool
+        Set True when tec_file is a .npz archive (e.g. from spinifex or a
+        custom solver). Default False (h5parm).
+    ref_rm : str
+        Name of the reference station for RM differencing. Must exist in
+        the RM file, TEC file, and geometry file.
+    ref_tec : str or None
+        Name of the reference station for TEC differencing. Defaults to
+        ref_rm if None. Useful when RM and TEC use different station names.
+    Err : float
+        Denominator threshold fraction passed to solve_T (default 0.05).
+    aliases : dict or None
+        Optional renaming map applied to station names in all three sources
+        before any matching is done. E.g. {"SuperSt": "CS002LBA"} renames
+        "SuperSt" to "CS002LBA" everywhere.
+
+    Returns
+    -------
+    T1 : (n_common, n_time, n_heights) ndarray
+    T2 : (n_common, n_time, n_heights) ndarray
+        Two T estimates from solve_T.
+    time_hr : (n_time,) ndarray
+        Time axis in hours, starting at 0, after bad time steps are removed.
+    heights : (n_heights,) ndarray
+        Height shells in km.
+    common : list of str
+        Station names in the order used for the first axis of all arrays.
+    B_c : (n_common, n_time, n_heights) ndarray
+        Magnetic field restricted to common stations and valid time steps.
+    am_c : (n_common, n_time, n_heights) ndarray
+        Airmass restricted to common stations and valid time steps.
+    dTEC_c : (n_common, n_time) ndarray
+        Differential TEC on the RM time grid, common stations only.
+    dRM_c : (n_common, n_time) ndarray
+        Differential RM, spike-masked, common stations only.
+    B_ref : (n_time, n_heights) ndarray
+        Magnetic field of the reference station.
+    am_ref : (n_time, n_heights) ndarray
+        Airmass of the reference station.
+    time_origin : float
+        Absolute start time of the RM axis in seconds (used by the plotting
+        layer to align external comparison data to the same time axis).
+    """
+
+    if aliases is None:
+        aliases = {}
+
+    def resolve(name):
+        return aliases.get(name, name)
+
+    # ---------------- GEOMETRY ----------------
+    with h5py.File(geom_file, "r") as f:
+        stations = [resolve(s) for s in as_str_list(f["stations"][:])]
+        am       = f["airmass"][:]
+        B        = -(f["b_parallel"][:])
+        heights  = f["heights_km"][:]
+
+    idx = {s: i for i, s in enumerate(stations)}
+
+    # ---------------- RM ----------------
+    h5_rm = h5parm(str(rm_file), readonly=True)
+    vals_rm, axes_rm = h5_rm.getSolset("sol000").getSoltab("rotationmeasure000").getValues(weight=False)
+    w_rm, _          = h5_rm.getSolset("sol000").getSoltab("rotationmeasure000").getValues(weight=True)
+    vals_rm = np.squeeze(vals_rm).astype(float)
+    w_rm    = np.squeeze(w_rm)
+    vals_rm[w_rm == 0] = np.nan
+    ants_rm     = [resolve(s) for s in as_str_list(axes_rm["ant"])]
+    time_rm     = np.squeeze(axes_rm["time"])
+    time_origin = time_rm.min()                   # seconds — for plot alignment only
+    time_hr     = (time_rm - time_origin) / 3600  # same as old code
+
+    if ref_rm not in ants_rm:
+        raise ValueError(f"ref_rm '{ref_rm}' not found in RM stations: {ants_rm}")
+
+    ref_idx_rm = ants_rm.index(ref_rm)
+    dRM = vals_rm - vals_rm[ref_idx_rm]
+    dRM = mask_spikes(dRM, threshold_factor=1.5, window=20)
+
+    # ---------------- TEC ----------------
+    if tec_is_npz:
+        data     = np.load(tec_file)
+        ants_tec = [resolve(s) for s in as_str_list(data["stations"])]
+        vals_tec = data["tec"]
+        time_tec     = Time(data["times"][1:], format="mjd")
+        # OLD behaviour: each starts from its own 0  ← this is what worked
+        time_tec_hr  = (time_tec.mjd - time_tec.mjd.min()) / 3600
+        if vals_tec.shape[0] != len(ants_tec):
+            vals_tec = vals_tec.T
+        vals_tec = vals_tec[:, 1:]
+    else:
+        h5_tec = h5parm(str(tec_file), readonly=True)
+        vals_tec, axes_tec = h5_tec.getSolset("sol000").getSoltab("tec000").getValues(weight=False)
+        w_tec, _           = h5_tec.getSolset("sol000").getSoltab("tec000").getValues(weight=True)
+        vals_tec = np.squeeze(vals_tec).astype(float)
+        w_tec    = np.squeeze(w_tec)
+        vals_tec[w_tec == 0] = np.nan
+        ants_tec    = [resolve(s) for s in as_str_list(axes_tec["ant"])]
+        time_tec    = np.squeeze(axes_tec["time"])
+        # OLD behaviour: each starts from its own 0
+        time_tec_hr = (time_tec - time_tec.min()) / 3600
+
+    if vals_tec.shape[0] != len(ants_tec):
+        vals_tec = vals_tec.T
+
+    # ---------------- REFERENCE ----------------
+    if ref_tec is None:
+        ref_tec = ref_rm
+    ref_tec = resolve(ref_tec)
+    ref_rm  = resolve(ref_rm)
+
+    if ref_tec not in ants_tec:
+        raise ValueError(f"ref_tec '{ref_tec}' not found in TEC stations: {ants_tec}")
+
+    ref_idx_tec = ants_tec.index(ref_tec)
+    dTEC = vals_tec - vals_tec[ref_idx_tec]
+
+    # align_tec_to_rm works in relative hours — fine with both starting at 0
+    dTEC = align_tec_to_rm(dTEC, time_tec_hr, time_hr)
+
+    # ---------------- COMMON STATIONS ----------------
+    common = [s for s in stations if s in ants_rm and s in ants_tec]
+
+    if ref_rm not in common:
+        missing_from = []
+        if ref_rm not in stations: missing_from.append("geometry")
+        if ref_rm not in ants_rm:  missing_from.append("RM")
+        if ref_rm not in ants_tec: missing_from.append("TEC")
+        raise ValueError(
+            f"ref_rm '{ref_rm}' must appear in all three sources. "
+            f"Missing from: {missing_from}. Common stations: {common}"
+        )
+
+    rm_idx   = [ants_rm.index(s)  for s in common]
+    tec_idx  = [ants_tec.index(s) for s in common]
+    geom_idx = [idx[s]            for s in common]
+
+    dRM_c  = dRM[rm_idx]
+    dTEC_c = dTEC[tec_idx]
+
+    # ---------------- REMOVE BAD TIME STEPS ----------------
+    valid_time_mask = ~(
+        np.all(np.isnan(dTEC_c), axis=0) |
+        np.all(np.isnan(dRM_c),  axis=0)
+    )
+    dTEC_c  = dTEC_c[:, valid_time_mask]
+    dRM_c   = dRM_c[:,  valid_time_mask]
+    time_hr = time_hr[  valid_time_mask]
+    B_c     = B[geom_idx][:, valid_time_mask, :]
+    am_c    = am[geom_idx][:, valid_time_mask, :]
+
+    ref_idx_common = common.index(ref_rm)
+    print(f"  ref_idx_common={ref_idx_common}  →  common[{ref_idx_common}]={common[ref_idx_common]}")
+
+    # ---------------- SOLVE ----------------
+    T1, T2, B_ref, am_ref = solve_T(
+        dRM_c, dTEC_c, B_c, am_c,
+        ref_idx=ref_idx_common, err=Err
+    )
+
+    # time_origin returned for plot alignment only — not used inside the pipeline
+    return T1, T2, time_hr, heights, common, B_c, am_c, dTEC_c, dRM_c, B_ref, am_ref, time_origin
+
+
+# =========================================================
+# PLOTTING
+# =========================================================
+
+def plot_both_datasets(ds1, ds2, ref_sta, H=350,
+                       # Dataset 1 comparison data
+                       gnss_stec_1=None, gnss_stations_1=None, gnss_times_mjd_1=None,
+                       ref_tec_1=None, ref_stations_1=None, ref_times_str_1=None,
+                       # Dataset 2 comparison data
+                       gnss_stec_2=None, gnss_stations_2=None, gnss_times_mjd_2=None,
+                       ref_tec_3d_2=None, ref_stations_2=None, ref_times_str_2=None,
+                       ref_heights_km_2=None, target_height=350):
+    """
+    Produce diagnostic figures comparing T1/T2 across two datasets side by side,
+    with external comparison data (GNSS sTEC and old reference TEC) overlaid.
+
+    Two figures are produced per call: one for RS-prefix stations and one for
+    all other stations. Each figure is a 2x2 grid:
+
+        rows    : T1 (top row) | T2 (bottom row)
+        columns : Dataset 1 (left) | Dataset 2 (right)
+
+    Within each subplot all stations in the group are plotted with distinct
+    colours. The GNSS sTEC and old reference TEC for ref_sta are overlaid
+    in black (dashed and dotted respectively) so the external data can be
+    compared to the solved T values at a glance.
+
+    Time alignment: all comparison time series are converted to hours relative
+    to each dataset's own RM time origin (stored in ds["time_origin"]) so they
+    land on the same horizontal axis as the pipeline output.
+
+    Parameters
+    ----------
+    ds1, ds2 : dict or None
+        Dataset dicts as returned by run_pipeline and stored in the main loop.
+        Required keys: 'stations', 'time', 'heights', 'T1', 'T2',
+        'time_origin'. Either may be None (that column is hidden).
+    ref_sta : str
+        The reference station for this iteration. Its GNSS and ref TEC series
+        are looked up and overlaid on every subplot.
+    H : float
+        Target height in km for slicing T1/T2 (default 350).
+
+    Dataset 1 comparison inputs
+    ---------------------------
+    gnss_stec_1 : (n_gnss, n_time) ndarray or None
+        GNSS slant TEC for dataset 1 (spinifex output).
+    gnss_stations_1 : list of str or None
+        Station names corresponding to rows of gnss_stec_1.
+    gnss_times_mjd_1 : (n_time,) ndarray or None
+        MJD times for gnss_stec_1.
+    ref_tec_1 : (n_sta, n_time) ndarray or None
+        2-D reference TEC matrix for dataset 1 (rm_tec_matrix.h5).
+    ref_stations_1 : array of str or None
+        Station names for ref_tec_1.
+    ref_times_str_1 : array of str or None
+        ISO time strings for ref_tec_1.
+
+    Dataset 2 comparison inputs
+    ---------------------------
+    gnss_stec_2 : (n_gnss, n_time) ndarray or None
+    gnss_stations_2 : list of str or None
+    gnss_times_mjd_2 : (n_time,) ndarray or None
+    ref_tec_3d_2 : (n_sta, n_time, n_heights) ndarray or None
+        Height-resolved reference TEC for dataset 2 (tec_height_resolved.h5).
+    ref_stations_2 : array of str or None
+    ref_times_str_2 : array of str or None
+    ref_heights_km_2 : (n_heights,) ndarray or None
+        Height axis for ref_tec_3d_2.
+    target_height : float
+        Height in km to slice ref_tec_3d_2 (default 350).
+    """
+
+    colors = plt.cm.tab20.colors
+
+    # ---- helpers: align comparison times to a pipeline origin (seconds) ----
+    def gnss_time_hr(gnss_times_mjd, t0_sec):
+        """Convert MJD array to hours relative to the pipeline time origin."""
+
+        if gnss_times_mjd is None or t0_sec is None:
+            return None
+        return (gnss_times_mjd * 86400.0 - t0_sec) / 3600.0
+
+    def ref_time_hr(ref_times_str, t0_sec):
+        """Convert ISO time string array to hours relative to the pipeline time origin."""
+
+        if ref_times_str is None or t0_sec is None:
+            return None
+        mjd = Time(ref_times_str, format="isot", scale="utc").mjd
+        return (mjd * 86400.0 - t0_sec) / 3600.0
+
+    # ---- height index for 3-D ref TEC (Dataset 2) ----
+    rh_idx_2 = None
+    if ref_tec_3d_2 is not None and ref_heights_km_2 is not None:
+        rh_idx_2 = np.argmin(np.abs(ref_heights_km_2 - target_height))
+
+    def get_ref_series(sta,
+                       gnss_stec, gnss_stations, gnss_thr,
+                       ref_tec, ref_tec_3d, ref_stations, r_thr, rh_idx):
+        """
+        Extract GNSS sTEC and old ref TEC time series for a single station.
+
+        Looks up `sta` in both comparison datasets and returns the matching
+        time and value arrays. Returns None for any source where the station
+        is absent.
+
+        Returns
+        -------
+        gnss_t, gnss_y, ref_t, ref_y : arrays or None
+        """
+
+        gnss_t = gnss_y = None
+        if gnss_stec is not None and gnss_stations is not None and sta in list(gnss_stations):
+            g_i    = list(gnss_stations).index(sta)
+            gnss_t = gnss_thr
+            gnss_y = gnss_stec[g_i]
+
+        ref_t = ref_y = None
+        if ref_tec_3d is not None and ref_stations is not None and sta in list(ref_stations):
+            r_i   = list(ref_stations).index(sta)
+            ref_t = r_thr
+            ref_y = ref_tec_3d[r_i, :, rh_idx]
+        elif ref_tec is not None and ref_stations is not None and sta in list(ref_stations):
+            r_i   = list(ref_stations).index(sta)
+            ref_t = r_thr
+            ref_y = ref_tec[r_i]
+
+        return gnss_t, gnss_y, ref_t, ref_y
+
+    # ---- per-dataset config (built after we know ds1/ds2) ----
+    def ds_config(ds, gnss_stec, gnss_stations, gnss_times_mjd,
+                  ref_tec, ref_tec_3d, ref_stations, ref_times_str, rh_idx):
+        """
+        Bundle a dataset dict with its pre-converted comparison time axes
+        into a single config dict consumed by make_figure.
+
+        Time axes are converted here once using the dataset's time_origin
+        so make_figure does not need to know about absolute times.
+        """
+
+        if ds is None:
+            return None
+        t0  = ds["time_origin"]
+        return dict(
+            ds          = ds,
+            gnss_stec   = gnss_stec,
+            gnss_stations = gnss_stations,
+            gnss_thr    = gnss_time_hr(gnss_times_mjd, t0),
+            ref_tec     = ref_tec,
+            ref_tec_3d  = ref_tec_3d,
+            ref_stations = ref_stations,
+            r_thr       = ref_time_hr(ref_times_str, t0),
+            rh_idx      = rh_idx,
+        )
+
+    cfg1 = ds_config(ds1,
+                     gnss_stec_1, gnss_stations_1, gnss_times_mjd_1,
+                     ref_tec_1, None, ref_stations_1, ref_times_str_1, None)
+    cfg2 = ds_config(ds2,
+                     gnss_stec_2, gnss_stations_2, gnss_times_mjd_2,
+                     None, ref_tec_3d_2, ref_stations_2, ref_times_str_2, rh_idx_2)
+
+    # ---- station groups ----
+    def group_indices(ds):
+        """
+        Split station list into RS-prefix and non-RS index lists.
+
+        RS stations (Remote Stations in LOFAR nomenclature) and core/international 
+        stations are plotted separately for clearer data quality.
+        """
+
+        if ds is None:
+            return [], []
+        stas  = ds["stations"]
+        rs    = [i for i, s in enumerate(stas) if s.startswith("RS")]
+        other = [i for i, s in enumerate(stas) if not s.startswith("RS")]
+        return rs, other
+
+    rs1, other1 = group_indices(ds1)
+    rs2, other2 = group_indices(ds2)
+
+    def make_figure(group_label, idx1, idx2):
+        """
+        Draw one 2x2 figure for a station group (RS or non-RS).
+
+        Each column corresponds to one dataset; each row to T1 or T2.
+        The comparison series for ref_sta (GNSS sTEC and old ref TEC) are
+        overlaid in black so the external calibration data can be compared
+        to the solved T values directly.
+        """
+
+        fig, axes = plt.subplots(2, 2, figsize=(18, 8), sharex=False)
+        fig.suptitle(
+            f"ref = {ref_sta}  —  {group_label} @ {H} km",
+            fontsize=13, fontweight="bold"
+        )
+
+        for col, (cfg, sta_indices) in enumerate([(cfg1, idx1), (cfg2, idx2)]):
+            if cfg is None or not sta_indices:
+                for row in range(2):
+                    axes[row][col].set_visible(False)
+                continue
+
+            ds       = cfg["ds"]
+            stations = ds["stations"]
+            time     = ds["time"]
+            heights  = ds["heights"]
+            h_idx    = np.argmin(np.abs(heights - H))
+            T1_h     = ds["T1"][:, :, h_idx]
+            T2_h     = ds["T2"][:, :, h_idx]
+
+            # comparison series for ref_sta only
+            gnss_t, gnss_y, ref_t, ref_y = get_ref_series(
+                ref_sta,
+                cfg["gnss_stec"], cfg["gnss_stations"], cfg["gnss_thr"],
+                cfg["ref_tec"],   cfg["ref_tec_3d"],
+                cfg["ref_stations"], cfg["r_thr"], cfg["rh_idx"]
+            )
+
+            for row, (T_h, label) in enumerate([(T1_h, "T1"), (T2_h, "T2")]):
+                ax = axes[row][col]
+
+                # all stations in group
+                for ci, si in enumerate(sta_indices):
+                    ax.plot(time, T_h[si], label=stations[si],
+                            color=colors[ci % 20], alpha=0.75, lw=1.2)
+
+                # GNSS sTEC of ref station
+                if gnss_y is not None:
+                    ax.plot(gnss_t, gnss_y, color="black", lw=2,
+                            ls="--", label=f"{ref_sta} GNSS sTEC", zorder=5)
+
+                # old ref TEC of ref station
+                if ref_y is not None:
+                    ax.plot(ref_t, ref_y, color="black", lw=2,
+                            ls=":",  label=f"{ref_sta} ref TEC",   zorder=5)
+
+                ax.set_title(f"Dataset {col + 1}  —  {label}")
+                ax.set_ylabel(label)
+                ax.set_xlabel("Time [hr]")
+                ax.grid(True, alpha=0.4)
+                n = len(sta_indices)
+                ax.legend(fontsize=6 if n > 10 else 8, ncol=2)
+
+        plt.tight_layout()
+        plt.show()
+
+    if rs1 or rs2:
+        make_figure("RS stations",     rs1, rs2)
+    if other1 or other2:
+        make_figure("Non-RS stations", other1, other2)
