@@ -1,3 +1,25 @@
+"""
+dsTEC / dRM calibration pipeline.
+
+This module reconstructs vertical TEC (vTEC) per station, time step,
+and ionospheric height shell from LOFAR-style differential rotation-measure (dRM) and
+differential slant TEC (dsTEC) calibration solutions, plus a geometry file containing
+the line-of-sight magnetic field and airmass for each assumed height
+shell.
+
+Layout
+------
+1. HELPERS      - small utility functions used by the pipeline
+                  (string decoding, interpolation, spike masking,
+                  and the core T-solving equations).
+2. PIPELINE     - `run_pipeline`, which loads the three input files,
+                  forms differentials against a reference station,
+                  aligns time grids, and calls `solve_T`.
+3. PLOTTING     - diagnostic figures comparing the pipeline output
+                  against external TEC/RM references (GNSS sTEC,
+                  legacy reference TEC files).
+"""
+
 import numpy as np
 import h5py
 import matplotlib.pyplot as plt
@@ -7,6 +29,8 @@ from scipy.interpolate import interp1d
 
 from losoto.h5parm import h5parm
 from astropy.time import Time
+
+from matplotlib.ticker import MaxNLocator
 
 
 # =========================================================
@@ -119,7 +143,7 @@ def mask_spikes(dRM, threshold_factor=3.0, window=20):
         Differential rotation measure time series.
     threshold_factor : float
         Number of standard deviations above which a sample is called a spike.
-        Lower values mask more aggressively (default 3.0; pipeline uses 1.5).
+        Lower values mask more aggressively (default 3.0).
     window : int
         Width of the uniform smoothing filter in samples.
 
@@ -307,6 +331,26 @@ def run_pipeline(geom_file, rm_file, tec_file,
         aliases = {}
 
     def resolve(name):
+        """
+        Map a raw station name to its canonical name via `aliases`.
+
+        Looked up against the `aliases` dict captured from the enclosing
+        `run_pipeline` call; names not present in `aliases` are returned
+        unchanged. Applied uniformly to station names from the geometry,
+        RM, and TEC sources so that a station recorded under different
+        labels in each file (e.g. "SuperSt" vs "CS002LBA") is treated as
+        the same station everywhere in the pipeline.
+
+        Parameters
+        ----------
+        name : str
+            Raw station name as read from a file.
+
+        Returns
+        -------
+        str
+            The aliased name, or `name` itself if no alias is defined.
+        """
         return aliases.get(name, name)
 
     # ---------------- GEOMETRY ----------------
@@ -423,10 +467,28 @@ def run_pipeline(geom_file, rm_file, tec_file,
 
 
 # =========================================================
-# PLOTTING
+# PLOTTING VERTICAL TEC
 # =========================================================
 
-def plot_both_datasets(ds1, ds2, ref_sta, H=350,
+import numpy as np
+import matplotlib.pyplot as plt
+from astropy.time import Time
+
+# =========================================================
+# GLOBAL FONT SIZE SETTINGS (increase text across all plots)
+# =========================================================
+plt.rcParams.update({
+    "font.size": 14,          # base font size
+    "axes.titlesize": 16,     # subplot titles
+    "axes.labelsize": 14,     # x/y axis labels
+    "xtick.labelsize": 12,    # x tick labels
+    "ytick.labelsize": 12,    # y tick labels
+    "legend.fontsize": 11,    # legend text
+    "figure.titlesize": 18,   # figure-level suptitle, if used
+})
+
+
+def plot_both_datasets(ds1, ds2, ref_sta, H1=350, H2=350,
                        # Dataset 1 comparison data
                        gnss_stec_1=None, gnss_stations_1=None, gnss_times_mjd_1=None,
                        ref_tec_1=None, ref_stations_1=None, ref_times_str_1=None,
@@ -435,19 +497,22 @@ def plot_both_datasets(ds1, ds2, ref_sta, H=350,
                        ref_tec_3d_2=None, ref_stations_2=None, ref_times_str_2=None,
                        ref_heights_km_2=None, target_height=350):
     """
-    Produce diagnostic figures comparing T1/T2 across two datasets side by side,
-    with external comparison data (GNSS sTEC and old reference TEC) overlaid.
+    Produce diagnostic figures comparing T1/T2 across two datasets, split by
+    RS vs Non-RS stations, with external comparison data (GNSS sTEC and old
+    reference TEC) overlaid.
 
-    Two figures are produced per call: one for RS-prefix stations and one for
-    all other stations. Each figure is a 2x2 grid:
+    Two figures are produced per call: one for T1, one for T2. Each figure
+    is a 2x2 grid:
 
-        rows    : T1 (top row) | T2 (bottom row)
-        columns : Dataset 1 (left) | Dataset 2 (right)
+        rows    : Dataset 1 (top row) | Dataset 2 (bottom row)
+        columns : RS stations (left)  | Non-RS stations (right)
 
     Within each subplot all stations in the group are plotted with distinct
     colours. The GNSS sTEC and old reference TEC for ref_sta are overlaid
-    in black (dashed and dotted respectively) so the external data can be
-    compared to the solved T values at a glance.
+    in black (dashed and dotted respectively). Within each row (i.e. for a
+    given dataset), the RS and Non-RS axes share the same y-limits, taken
+    from the RS subplot's autoscaled range, so the two station groups are
+    directly comparable.
 
     Time alignment: all comparison time series are converted to hours relative
     to each dataset's own RM time origin (stored in ds["time_origin"]) so they
@@ -458,12 +523,12 @@ def plot_both_datasets(ds1, ds2, ref_sta, H=350,
     ds1, ds2 : dict or None
         Dataset dicts as returned by run_pipeline and stored in the main loop.
         Required keys: 'stations', 'time', 'heights', 'T1', 'T2',
-        'time_origin'. Either may be None (that column is hidden).
+        'time_origin'. Either may be None (that row is hidden).
     ref_sta : str
         The reference station for this iteration. Its GNSS and ref TEC series
         are looked up and overlaid on every subplot.
-    H : float
-        Target height in km for slicing T1/T2 (default 350).
+    H1, H2 : float
+        Target height in km for dataset 1/2 respectively. Slicing T1/T2 (default 350).
 
     Dataset 1 comparison inputs
     ---------------------------
@@ -500,14 +565,12 @@ def plot_both_datasets(ds1, ds2, ref_sta, H=350,
     # ---- helpers: align comparison times to a pipeline origin (seconds) ----
     def gnss_time_hr(gnss_times_mjd, t0_sec):
         """Convert MJD array to hours relative to the pipeline time origin."""
-
         if gnss_times_mjd is None or t0_sec is None:
             return None
         return (gnss_times_mjd * 86400.0 - t0_sec) / 3600.0
 
     def ref_time_hr(ref_times_str, t0_sec):
         """Convert ISO time string array to hours relative to the pipeline time origin."""
-
         if ref_times_str is None or t0_sec is None:
             return None
         mjd = Time(ref_times_str, format="isot", scale="utc").mjd
@@ -532,7 +595,6 @@ def plot_both_datasets(ds1, ds2, ref_sta, H=350,
         -------
         gnss_t, gnss_y, ref_t, ref_y : arrays or None
         """
-
         gnss_t = gnss_y = None
         if gnss_stec is not None and gnss_stations is not None and sta in list(gnss_stations):
             g_i    = list(gnss_stations).index(sta)
@@ -553,75 +615,64 @@ def plot_both_datasets(ds1, ds2, ref_sta, H=350,
 
     # ---- per-dataset config (built after we know ds1/ds2) ----
     def ds_config(ds, gnss_stec, gnss_stations, gnss_times_mjd,
-                  ref_tec, ref_tec_3d, ref_stations, ref_times_str, rh_idx):
+                  ref_tec, ref_tec_3d, ref_stations, ref_times_str, rh_idx, H):
         """
-        Bundle a dataset dict with its pre-converted comparison time axes
-        into a single config dict consumed by make_figure.
+        Bundle a dataset dict with its pre-converted comparison time axes,
+        target height, and RS/Non-RS station index groups into a single
+        config dict consumed by make_figure.
 
         Time axes are converted here once using the dataset's time_origin
         so make_figure does not need to know about absolute times.
         """
-
         if ds is None:
             return None
-        t0  = ds["time_origin"]
+        t0    = ds["time_origin"]
+        stas  = ds["stations"]
+        rs    = [i for i, s in enumerate(stas) if s.startswith("RS")]
+        other = [i for i, s in enumerate(stas) if not s.startswith("RS") and not s.startswith("CS") and not s.startswith("FR")]
         return dict(
-            ds          = ds,
-            gnss_stec   = gnss_stec,
+            ds            = ds,
+            H             = H,
+            gnss_stec     = gnss_stec,
             gnss_stations = gnss_stations,
-            gnss_thr    = gnss_time_hr(gnss_times_mjd, t0),
-            ref_tec     = ref_tec,
-            ref_tec_3d  = ref_tec_3d,
-            ref_stations = ref_stations,
-            r_thr       = ref_time_hr(ref_times_str, t0),
-            rh_idx      = rh_idx,
+            gnss_thr      = gnss_time_hr(gnss_times_mjd, t0),
+            ref_tec       = ref_tec,
+            ref_tec_3d    = ref_tec_3d,
+            ref_stations  = ref_stations,
+            r_thr         = ref_time_hr(ref_times_str, t0),
+            rh_idx        = rh_idx,
+            rs_idx        = rs,
+            other_idx     = other,
         )
 
     cfg1 = ds_config(ds1,
                      gnss_stec_1, gnss_stations_1, gnss_times_mjd_1,
-                     ref_tec_1, None, ref_stations_1, ref_times_str_1, None)
+                     ref_tec_1, None, ref_stations_1, ref_times_str_1, None, H1)
     cfg2 = ds_config(ds2,
                      gnss_stec_2, gnss_stations_2, gnss_times_mjd_2,
-                     None, ref_tec_3d_2, ref_stations_2, ref_times_str_2, rh_idx_2)
+                     None, ref_tec_3d_2, ref_stations_2, ref_times_str_2, rh_idx_2, H2)
 
-    # ---- station groups ----
-    def group_indices(ds):
+    def make_figure(t_key, t_label):
         """
-        Split station list into RS-prefix and non-RS index lists.
+        Draw one 2x2 figure for a given T-quantity (T1 or T2).
 
-        RS stations (Remote Stations in LOFAR nomenclature) and core/international 
-        stations are plotted separately for clearer data quality.
-        """
-
-        if ds is None:
-            return [], []
-        stas  = ds["stations"]
-        rs    = [i for i, s in enumerate(stas) if s.startswith("RS")]
-        other = [i for i, s in enumerate(stas) if not s.startswith("RS")]
-        return rs, other
-
-    rs1, other1 = group_indices(ds1)
-    rs2, other2 = group_indices(ds2)
-
-    def make_figure(group_label, idx1, idx2):
-        """
-        Draw one 2x2 figure for a station group (RS or non-RS).
-
-        Each column corresponds to one dataset; each row to T1 or T2.
-        The comparison series for ref_sta (GNSS sTEC and old ref TEC) are
-        overlaid in black so the external calibration data can be compared
-        to the solved T values directly.
+        Rows correspond to datasets (Dataset 1 top, Dataset 2 bottom);
+        columns correspond to station group (RS left, Non-RS right). Within
+        each row, the Non-RS axis is forced to share the y-limits of the
+        RS axis (taken after RS autoscales). Since columns share y and rows
+        share x, only the outer axes (left column, bottom row) are labeled
+        and tick-labeled; inner axes have their redundant tick labels hidden.
         """
 
         fig, axes = plt.subplots(2, 2, figsize=(18, 8), sharex=False)
         fig.suptitle(
-            f"ref = {ref_sta}  —  {group_label} @ {H} km",
-            fontsize=13, fontweight="bold"
+            f"ref = {ref_sta}  —  {t_label}  (H1={H1} km / H2={H2} km)",
+            fontsize=19, fontweight="bold"
         )
 
-        for col, (cfg, sta_indices) in enumerate([(cfg1, idx1), (cfg2, idx2)]):
-            if cfg is None or not sta_indices:
-                for row in range(2):
+        for row, cfg in enumerate([cfg1, cfg2]):
+            if cfg is None:
+                for col in range(2):
                     axes[row][col].set_visible(False)
                 continue
 
@@ -629,9 +680,9 @@ def plot_both_datasets(ds1, ds2, ref_sta, H=350,
             stations = ds["stations"]
             time     = ds["time"]
             heights  = ds["heights"]
+            H        = cfg["H"]
             h_idx    = np.argmin(np.abs(heights - H))
-            T1_h     = ds["T1"][:, :, h_idx]
-            T2_h     = ds["T2"][:, :, h_idx]
+            T_h      = ds[t_key][:, :, h_idx]
 
             # comparison series for ref_sta only
             gnss_t, gnss_y, ref_t, ref_y = get_ref_series(
@@ -641,8 +692,15 @@ def plot_both_datasets(ds1, ds2, ref_sta, H=350,
                 cfg["ref_stations"], cfg["r_thr"], cfg["rh_idx"]
             )
 
-            for row, (T_h, label) in enumerate([(T1_h, "T1"), (T2_h, "T2")]):
+            groups = [("Remote stations", cfg["rs_idx"]), ("International stations", cfg["other_idx"])]
+            row_ylim = None
+
+            for col, (group_label, sta_indices) in enumerate(groups):
                 ax = axes[row][col]
+
+                if not sta_indices:
+                    ax.set_visible(False)
+                    continue
 
                 # all stations in group
                 for ci, si in enumerate(sta_indices):
@@ -652,24 +710,322 @@ def plot_both_datasets(ds1, ds2, ref_sta, H=350,
                 # GNSS sTEC of ref station
                 if gnss_y is not None:
                     ax.plot(gnss_t, gnss_y, color="black", lw=2,
-                            ls="--", label=f"{ref_sta} GNSS sTEC", zorder=5)
+                            ls="--", label=f"{ref_sta} GNSS vTEC", zorder=5)
 
                 # old ref TEC of ref station
                 if ref_y is not None:
                     ax.plot(ref_t, ref_y, color="black", lw=2,
-                            ls=":",  label=f"{ref_sta} ref TEC",   zorder=5)
+                            ls=":",  label=f"{ref_sta} ref vTEC",   zorder=5)
 
-                ax.set_title(f"Dataset {col + 1}  —  {label}")
-                ax.set_ylabel(label)
-                ax.set_xlabel("Time [hr]")
+                ax.set_title(f"Dataset {row + 1}  —  {group_label} @ {H} km", fontsize=16)
                 ax.grid(True, alpha=0.4)
                 n = len(sta_indices)
-                ax.legend(fontsize=6 if n > 10 else 8, ncol=2)
+                ax.legend(fontsize=9 if n > 10 else 11, ncol=2)
+                ax.tick_params(axis="both", labelsize=12)
+
+                # ---- share y-limits within the row: RS sets it, Non-RS inherits ----
+                if col == 0:
+                    row_ylim = ax.get_ylim()
+                    lo, hi = row_ylim
+                    if lo < 0:
+                        lo = 0
+                    if hi > 40:
+                        hi = 40
+                    row_ylim = (lo, hi)
+                    ax.set_ylim(row_ylim)
+                elif row_ylim is not None:
+                    ax.set_ylim(row_ylim)
+
+                # ---- only label/tick the outer axes (left column, bottom row) ----
+                is_last_row = (row == len(groups) - 1) or (row == 1)
+                if col == 0:
+                    ax.set_ylabel(f"vTEC [TECU]", fontsize=14)
+                else:
+                    ax.tick_params(labelleft=False)
+
+                if row == 1:
+                    ax.set_xlabel("Time [hr]", fontsize=14)
+                else:
+                    ax.tick_params(labelbottom=False)
 
         plt.tight_layout()
         plt.show()
 
-    if rs1 or rs2:
-        make_figure("RS stations",     rs1, rs2)
-    if other1 or other2:
-        make_figure("Non-RS stations", other1, other2)
+    make_figure("T1", r"vTEC @ S")
+    make_figure("T2", r"vTEC @ REF")
+# =========================================================
+# PLOTTING dTEC COMPARISON
+# =========================================================
+
+def plot_dtec_comparison_grid(
+    ds1, ds2, ref_sta,
+    # Dataset 1 comparison data
+    gnss_stec_1=None, gnss_stations_1=None, gnss_times_mjd_1=None,
+    ref_tec_1=None, ref_stations_1=None, ref_times_str_1=None,
+    # Dataset 2 comparison data
+    gnss_stec_2=None, gnss_stations_2=None, gnss_times_mjd_2=None,
+    ref_tec_3d_2=None, ref_stations_2=None, ref_times_str_2=None,
+    ref_heights_km_2=None, target_height=350,
+    ncols=5,
+):
+    """
+    Grid-layout companion to plot_both_datasets: one figure per dataset
+    (ds1, ds2), with a small subplot per station instead of one combined
+    plot. Each subplot shows, relative to ref_sta:
+
+      "My data"      -> ds["dTEC"][i]                       (pipeline output, already
+                                                                differenced against ref_sta)
+      "Old ref"       -> TEC[station] - TEC[ref_sta]           (legacy h5 reference TEC)
+      "GNSS old ref"  -> sTEC[station] - sTEC[ref_sta]          (spinifex GNSS sTEC)
+
+    Call this with the exact same arguments you already pass to
+    plot_both_datasets (ds1, ds2, ref_sta, plus the gnss_*/ref_* comparison
+    data) — it shares the same time_origin-based alignment so the lines land
+    on the same hour axis as ds["time"].
+
+    Parameters
+    ----------
+    ds1, ds2 : dict or None
+        Dataset dicts from the main loop. Required keys: 'name', 'stations',
+        'time', 'dTEC', 'time_origin'. Either may be None.
+    ref_sta : str
+        Reference station for this iteration (used for the differencing).
+    target_height : float
+        Height in km used to slice ref_tec_3d_2 (dataset 2 is height-resolved).
+    ncols : int
+        Number of subplot columns in the grid.
+    """
+
+    # ---- helpers: align comparison times to a pipeline origin (seconds),
+    # mirrors plot_both_datasets exactly ----
+    def gnss_time_hr(gnss_times_mjd, t0_sec):
+        """
+        Convert an array of GNSS sample times (MJD) to hours relative to
+        the pipeline's RM time origin `t0_sec` (seconds).
+
+        Returns None if either input is missing, so callers can pass
+        through absent comparison data without special-casing it.
+        """
+        if gnss_times_mjd is None or t0_sec is None:
+            return None
+        return (gnss_times_mjd * 86400.0 - t0_sec) / 3600.0
+
+    def ref_time_hr(ref_times_str, t0_sec):
+        """
+        Convert an array of ISO-format time strings (legacy reference TEC
+        files) to hours relative to the pipeline's RM time origin `t0_sec`
+        (seconds).
+
+        Returns None if either input is missing.
+        """
+        if ref_times_str is None or t0_sec is None:
+            return None
+        mjd = Time(ref_times_str, format="isot", scale="utc").mjd
+        return (mjd * 86400.0 - t0_sec) / 3600.0
+
+    rh_idx_2 = None
+    if ref_tec_3d_2 is not None and ref_heights_km_2 is not None:
+        rh_idx_2 = np.argmin(np.abs(ref_heights_km_2 - target_height))
+
+    def make_grid(ds, gnss_stec, gnss_stations, gnss_times_mjd,
+                  ref_tec, ref_tec_3d, ref_stations, ref_times_str, rh_idx):
+        """
+        Build and show the per-station dTEC comparison grid for one dataset.
+
+        For each station in `ds`, draws a small subplot overlaying up to
+        three curves — the pipeline's own dTEC, the legacy reference TEC
+        difference, and the GNSS sTEC difference — all referenced against
+        `ref_sta` from the enclosing call and aligned to `ds["time"]` via
+        `ds["time_origin"]`. Does nothing if `ds` is None or has no
+        stations.
+
+        Parameters
+        ----------
+        ds : dict or None
+            Dataset dict with keys 'name', 'stations', 'time', 'dTEC',
+            'time_origin'.
+        gnss_stec, gnss_stations, gnss_times_mjd : arrays or None
+            GNSS sTEC comparison data for this dataset, as passed to the
+            enclosing function (dataset-specific suffix already resolved
+            by the caller).
+        ref_tec, ref_tec_3d, ref_stations, ref_times_str : arrays or None
+            Legacy reference TEC comparison data for this dataset; exactly
+            one of ref_tec (2-D) or ref_tec_3d (height-resolved) is
+            expected to be non-None.
+        rh_idx : int or None
+            Height index into ref_tec_3d matching `target_height`, or None
+            if ref_tec_3d is not used for this dataset.
+        """
+
+        if ds is None:
+            return
+
+        t0 = ds["time_origin"]
+        time = ds["time"]
+        stations = ds["stations"]
+
+        gnss_thr = gnss_time_hr(gnss_times_mjd, t0)
+        ref_thr = ref_time_hr(ref_times_str, t0)
+
+        gnss_stations = list(gnss_stations) if gnss_stations is not None else []
+        ref_stations = list(ref_stations) if ref_stations is not None else []
+
+        ref_idx_gnss = gnss_stations.index(ref_sta) if ref_sta in gnss_stations else None
+        ref_idx_ref = ref_stations.index(ref_sta) if ref_sta in ref_stations else None
+
+        plot_items = list(enumerate(stations))
+        n = len(plot_items)
+        if n == 0:
+            return
+
+        nrows = int(np.ceil(n / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(3.6 * ncols, 2.8 * nrows), squeeze=False, sharex=False, sharey=False)
+        axes_flat = axes.flatten()
+        legend_handles = {}
+
+        for ax, (i, station) in zip(axes_flat, plot_items):
+
+            # 1) My data ----------------------------------------------------
+            if ds["dTEC"] is not None:
+                l, = ax.plot(time, ds["dTEC"][i], color="tab:orange", linewidth=1)
+                legend_handles.setdefault("My data", l)
+
+            # 2) Old ref (legacy h5, station - ref_sta) ----------------------
+            if ref_idx_ref is not None and station in ref_stations and ref_thr is not None:
+                s_idx = ref_stations.index(station)
+
+                if ref_tec_3d is not None and rh_idx is not None:
+                    diff = ref_tec_3d[s_idx, :, rh_idx] - ref_tec_3d[ref_idx_ref, :, rh_idx]
+                elif ref_tec is not None:
+                    diff = ref_tec[s_idx] - ref_tec[ref_idx_ref]
+                else:
+                    diff = None
+
+                if diff is not None:
+                    diff_interp = np.interp(time, ref_thr, diff)
+                    l, = ax.plot(time, diff_interp, color="tab:green", linewidth=1)
+                    legend_handles.setdefault("Old Spinifex", l)
+
+            # 3) GNSS old ref (spinifex sTEC, station - ref_sta) --------------
+            if ref_idx_gnss is not None and station in gnss_stations and gnss_thr is not None:
+                s_idx = gnss_stations.index(station)
+                diff = gnss_stec[s_idx] - gnss_stec[ref_idx_gnss]
+                diff_interp = np.interp(time, gnss_thr, diff)
+
+                l, = ax.plot(time, diff_interp, color="tab:blue", linewidth=1)
+                legend_handles.setdefault("GNSS Spinifex", l)
+
+            # station label inside the subplot (top-left), not a title
+            ax.text(0.04, 0.92, station, transform=ax.transAxes,
+                    fontsize=11, va="top", ha="left")
+
+            ax.xaxis.set_major_locator(MaxNLocator(4))
+            ax.tick_params(axis="x", labelrotation=45, labelsize=9)
+            ax.tick_params(axis="y", labelsize=10)
+
+            col = i % ncols
+            row = i // ncols
+            if col == 0:
+                ax.set_ylabel(r"dTEC [TECU]", fontsize=9)
+            if row == nrows - 1 or i >= n - ncols:
+                ax.set_xlabel(r"Time [hours]", fontsize=9)
+                
+        # turn off any unused grid cells
+        for ax in axes_flat[n:]:
+            ax.axis("off")
+
+        if legend_handles:
+            fig.legend(legend_handles.values(), legend_handles.keys(),
+                       loc="upper center", ncol=len(legend_handles),
+                       bbox_to_anchor=(0.5, 1.02), frameon=False)
+
+        fig.suptitle(f"{ds['name']} — dTEC comparison", y=1.05)
+        fig.tight_layout()
+        plt.show()
+
+    make_grid(ds1, gnss_stec_1, gnss_stations_1, gnss_times_mjd_1,
+              ref_tec_1, None, ref_stations_1, ref_times_str_1, None)
+    make_grid(ds2, gnss_stec_2, gnss_stations_2, gnss_times_mjd_2,
+              None, ref_tec_3d_2, ref_stations_2, ref_times_str_2, rh_idx_2)
+    
+
+# =========================================================
+# PLOTTING dRM GRID
+# =========================================================
+
+def plot_drm_grid(ds1, ds2, ref_sta, ncols=5):
+    """
+    Grid-layout plot of differential RM for two datasets, one figure each.
+
+    Each subplot shows dRM[i] (already differenced against ref_sta) for
+    one station, mirroring the layout of plot_dtec_comparison_grid but
+    without any external comparison overlays.
+
+    Parameters
+    ----------
+    ds1, ds2 : dict or None
+        Dataset dicts from the main loop. Required keys: 'name', 'stations',
+        'time', 'dRM', 'time_origin'. Either may be None.
+    ref_sta : str
+        Reference station name (used only for the figure title).
+    ncols : int
+        Number of subplot columns in the grid.
+    """
+
+    def make_grid(ds):
+        """
+        Build and show the per-station dRM grid for one dataset.
+
+        Draws one subplot per station showing its differential RM time
+        series (already referenced against `ref_sta` upstream in
+        `run_pipeline`). Does nothing if `ds` is None or has no stations.
+
+        Parameters
+        ----------
+        ds : dict or None
+            Dataset dict with keys 'name', 'stations', 'time', 'dRM'.
+        """
+        if ds is None:
+            return
+
+        time     = ds["time"]
+        stations = ds["stations"]
+        dRM      = ds["dRM"]
+
+        n = len(stations)
+        if n == 0:
+            return
+
+        nrows = int(np.ceil(n / ncols))
+        fig, axes = plt.subplots(
+            nrows, ncols,
+            figsize=(3.6 * ncols, 2.8 * nrows),
+            squeeze=False, sharex=False, sharey=False,
+        )
+        axes_flat = axes.flatten()
+
+        for ax, (i, station) in zip(axes_flat, enumerate(stations)):
+            ax.plot(time, dRM[i], color="tab:orange", linewidth=1)
+
+            ax.text(0.04, 0.92, station, transform=ax.transAxes,
+                    fontsize=11, va="top", ha="left")
+
+            ax.xaxis.set_major_locator(MaxNLocator(4))
+            ax.tick_params(axis="x", labelrotation=45, labelsize=9)
+            ax.tick_params(axis="y", labelsize=10)
+
+            col = i % ncols
+            if col == 0:
+                ax.set_ylabel(r"dRM [rad/m²]", fontsize=9)
+            if i >= n - ncols:
+                ax.set_xlabel(r"Time [hours]", fontsize=9)
+
+        for ax in axes_flat[n:]:
+            ax.axis("off")
+
+        fig.suptitle(f"{ds['name']} — dRM  (ref: {ref_sta})", y=1.02)
+        fig.tight_layout()
+        plt.show()
+
+    make_grid(ds1)
+    make_grid(ds2)
