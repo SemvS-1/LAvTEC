@@ -1,0 +1,191 @@
+"""
+Compute the geometry file consumed by `run_pipeline` in tec_rm_pipeline.py:
+per-station, per-time, per-height-shell airmass and line-of-sight magnetic
+field (`b_parallel`), saved to an HDF5 file with keys 'stations', 'times',
+'heights_km', 'airmass', 'b_parallel'.
+
+Where airmass and B come from
+------------------------------
+Both quantities describe the ray path from each LOFAR station to a fixed
+calibrator source, evaluated at a stack of assumed single-layer ionospheric
+heights (a standard thin-shell approximation):
+
+1. Ionospheric pierce point (IPP): for a given station, time, and shell
+   height, the IPP is the point where the station-to-source line of sight
+   crosses that height shell. `spinifex.geometry.get_ipp.get_ipp_from_skycoord`
+   computes this from the station's Earth-centred location, the source
+   direction, and the shell height, for every requested time simultaneously.
+
+2. Airmass: the geometric path-length factor at the IPP — i.e. how much
+   longer the slant path through the shell is compared to the vertical
+   path (approximately 1/cos(zenith angle) at the pierce point). This
+   comes back as `ipp.airmass` and is what converts vTEC into
+   slant TEC (and vice versa).
+
+3. Line-of-sight magnetic field (`b_parallel`): the component of Earth's
+   magnetic field along the line of sight at the IPP, which couples TEC to 
+   Faraday rotation. This script gets it from
+   `spinifex.magnetic.magnetic_models.ppigrf`, which evaluates the IGRF
+   magnetic field model (via the `ppigrf` package) at each IPP's location
+   and time and projects it onto the line-of-sight direction.
+
+Both are computed independently for every (station, time, height) triple
+and stacked into 3-D arrays, since the pierce-point location — and hence
+both the airmass and the field along the line of sight — changes with
+height for a fixed station/source/time.
+
+Dependencies
+------------
+Requires `lofarantpos`, `spinifex`, and `ppigrf` (LOFAR/ionosphere-specific
+packages) in addition to the usual numpy/astropy/h5py stack.
+"""
+
+import numpy as np
+import h5py
+from pathlib import Path
+
+import astropy.units as u
+from astropy.coordinates import EarthLocation, SkyCoord
+from astropy.time import Time
+
+from lofarantpos.db import LofarAntennaDatabase
+from spinifex.geometry.get_ipp import get_ipp_from_skycoord
+from spinifex.magnetic import magnetic_models
+from losoto.h5parm import h5parm
+
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+# Directory holding your input/output files. Change this one line to move
+# the whole script to a different machine or project layout.
+BASE_DIR = Path("data")
+
+# h5parm file used only to read off the observation's time axis (the RM
+# solutions themselves aren't used here — any h5parm with the right time
+# axis and soltab name would do, e.g. the same file run_pipeline uses).
+RM_SOLTAB_FILE = BASE_DIR / "cal-fr2.h5"
+RM_SOLSET_NAME = "sol000"
+RM_SOLTAB_NAME = "rotationmeasure000"
+
+# Calibrator / target source direction; resolved by name via SkyCoord's
+# online lookup (Simbad). Replace with your own source, or construct a
+# SkyCoord directly (e.g. SkyCoord(ra=..., dec=..., unit="deg")) if you
+# need an offline / non-standard direction.
+SOURCE_NAME = "3C380"
+
+# Assumed single-layer ionospheric height shells to evaluate, in km.
+# 100-700 km in 50 km steps is a typical range spanning the F-layer peak.
+HEIGHTS_KM = np.arange(100, 701, 50)
+
+# LOFAR station names to compute geometry for. Any name not present in
+# the antenna database is skipped (see the try/except in the main loop).
+STATIONS = ['CS002LBA', 'RS106LBA', 'RS205LBA', 'RS208LBA',
+            'RS210LBA', 'RS305LBA', 'RS306LBA', 'RS310LBA',
+            'RS406LBA', 'RS409LBA', 'RS503LBA', 'RS508LBA',
+            'RS509LBA', 'DE601LBA', 'DE602LBA', 'DE603LBA',
+            'DE604LBA', 'DE605LBA', 'FR606LBA', 'SE607LBA',
+            'UK608LBA', 'DE609LBA', 'PL610LBA', 'PL611LBA',
+            'PL612LBA', 'IE613LBA']
+
+# Output location: BASE_DIR / OUTPUT_SUBDIR / OUTPUT_FILENAME
+OUTPUT_SUBDIR   = "CSC_and_B_HEIGHTSTEPS2"
+OUTPUT_FILENAME = "geom_and_magnetic.h5"
+
+
+# =========================================================
+# LOAD TIME AXIS FROM AN EXISTING H5PARM
+# =========================================================
+# We only need the time axis here, so any h5parm containing the relevant
+# soltab (with the same times you want geometry for) is sufficient — this
+# does not need to be the same file used later for the RM fit itself,
+# though in practice it usually is.
+h5_rm = h5parm(str(RM_SOLTAB_FILE), readonly=True)
+_, axes_rm = h5_rm.getSolset(RM_SOLSET_NAME).getSoltab(RM_SOLTAB_NAME).getValues(weight=False)
+time_rm = np.squeeze(axes_rm["time"])
+h5_rm.close()
+
+# h5parm time axis is in seconds (MJD seconds); convert to an astropy Time
+# array in the format spinifex expects.
+times = Time(time_rm / 86400.0, format="mjd")
+
+# =========================================================
+# SETUP: antenna database + source direction + height grid
+# =========================================================
+lofardb = LofarAntennaDatabase()
+source  = SkyCoord.from_name(SOURCE_NAME)
+heights = HEIGHTS_KM * u.km
+
+n_stations = len(STATIONS)
+n_times    = len(times)
+n_heights  = len(heights)
+
+# =========================================================
+# ALLOCATE OUTPUT ARRAYS
+# =========================================================
+# NaN-filled so that any station skipped below (e.g. not present in the
+# antenna database) is clearly distinguishable downstream from a station
+# that was computed but happened to be zero.
+airmass_array = np.full((n_stations, n_times, n_heights), np.nan)
+bpar_array    = np.full((n_stations, n_times, n_heights), np.nan)
+
+# =========================================================
+# MAIN LOOP: per station, per height shell
+# =========================================================
+for i, st in enumerate(STATIONS):
+    try:
+        # Station phase-centre position (geocentric XYZ, metres) from the
+        # LOFAR antenna database, converted to an astropy EarthLocation.
+        loc = EarthLocation.from_geocentric(
+            *lofardb.phase_centres[st], unit=u.m
+        )
+
+        for j, h in enumerate(heights):
+            # Ionospheric pierce point for this station/source/time, at a
+            # single assumed shell height `h`. `times` is passed whole, so
+            # ipp holds every time step's pierce point for this height.
+            ipp = get_ipp_from_skycoord(
+                loc=loc,
+                times=times,
+                source=source,
+                height_array=h,
+            )
+
+            # Slant-path geometry factor at this shell height, one value
+            # per time step.
+            airmass_array[i, :, j] = np.squeeze(ipp.airmass)
+
+            # IGRF magnetic field at the pierce point, projected onto the
+            # line of sight, one value per time step.
+            mag = magnetic_models.ppigrf(ipp)
+            bpar_array[i, :, j] = np.squeeze(mag.magnetic_field)
+
+    except KeyError:
+        # Station name not found in the antenna database (e.g. a typo, or
+        # a station outside the database's coverage) — leave its row as
+        # NaN and move on rather than aborting the whole run.
+        continue
+
+
+# =========================================================
+# SAVE
+# =========================================================
+# Layout matches what tec_rm_pipeline.run_pipeline expects to read:
+#   stations    : (n_stations,)                   byte strings
+#   heights_km  : (n_heights,)
+#   airmass     : (n_stations, n_times, n_heights)
+#   b_parallel  : (n_stations, n_times, n_heights)
+# 'times' is included for reference/debugging but is not read back by
+# run_pipeline, which derives its own time axis from the RM/TEC files.
+output_dir = BASE_DIR / OUTPUT_SUBDIR
+output_dir.mkdir(parents=True, exist_ok=True)
+
+with h5py.File(output_dir / OUTPUT_FILENAME, "w") as f:
+    f.create_dataset("stations", data=np.array(STATIONS, dtype="S"))
+    f.create_dataset("times", data=np.array(times.isot, dtype="S"))
+    f.create_dataset("heights_km", data=heights.value)
+
+    f.create_dataset("airmass", data=airmass_array)
+    f.create_dataset("b_parallel", data=bpar_array)
+
+print(f"Saved geometry to {output_dir / OUTPUT_FILENAME}")
