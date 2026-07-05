@@ -1,0 +1,271 @@
+"""
+Example driver script for the TEC / RM calibration pipeline
+(see tec_rm_pipeline.py for `run_pipeline`, `plot_both_datasets`,
+`plot_dtec_comparison_grid`, and `plot_drm_grid`).
+
+What this script does
+----------------------
+1. Loads a set of *external comparison* datasets once: independent GNSS
+   slant-TEC estimates and two "legacy" reference-TEC solutions. These are
+   only used for plotting sanity checks against the pipeline's own output —
+   they are not inputs to `run_pipeline` itself.
+2. Runs the pipeline once per dataset with an arbitrary reference station
+   just to discover which stations are available in each dataset, and
+   builds the union of all station names ("candidate reference stations").
+3. Loops over every candidate station, treating it in turn as the
+   reference station (`ref_rm` / `ref_tec`) for both datasets, and:
+     - re-runs `run_pipeline` for Dataset 1 and Dataset 2 with that
+       reference station,
+     - packages each result into a small `dict` ("ds1"/"ds2") that the
+       plotting functions expect,
+     - produces up to three diagnostic figures per reference station.
+
+Why loop over reference stations at all?
+-----------------------------------------
+`solve_T` computes absolute TEC from *differences* against one reference
+station, so the numerical stability of the result depends on which station
+is chosen as the reference (a bad reference can give more masked/NaN
+samples, see `solve_T`'s `eps` threshold). Running the whole pipeline once
+per candidate and inspecting the resulting plots is a simple way to spot
+which reference stations give clean, physically sensible results before
+committing to one for further analysis.
+
+Directory / file layout expected below
+---------------------------------------
+This script assumes a `BASE_DIR` containing (rename to match your own
+project — see "Configuration" below):
+
+    BASE_DIR/
+      spinifex_gnss_2020_with_rs.npz          # GNSS sTEC comparison, dataset 1 epoch
+      spinifex_gnss_2024_with_rs.npz          # GNSS sTEC comparison, dataset 2 epoch
+      RM_and_TEC/
+        rm_tec_matrix.h5                      # legacy 2-D reference TEC, dataset 1
+      RM_TEC_HEIGHTSTEPS2/
+        tec_height_resolved.h5                # legacy height-resolved reference TEC, dataset 2
+      CSC_and_B_HEIGHTSTEPS/
+        geom_and_magnetic.h5                  # geometry (B-field, airmass) for dataset 1
+      CSC_and_B_HEIGHTSTEPS2/
+        geom_and_magnetic.h5                  # geometry (B-field, airmass) for dataset 2
+      cal-fr.h5                               # RM h5parm solutions, dataset 1
+      cal-fr2.h5                              # RM h5parm solutions, dataset 2
+      clock_tec_phase0_smooth.npz             # TEC solutions (.npz), dataset 1
+      dtec_fit.npz                            # TEC solutions (.npz), dataset 2
+
+"Dataset 1" and "Dataset 2" are just two independent observing epochs (or
+processing runs) that you want to solve and compare side by side; nothing
+about the pipeline requires exactly two — see "Extending to N datasets"
+at the bottom of this file for the general pattern.
+"""
+
+import numpy as np
+import h5py
+from pathlib import Path
+
+from tec_rm_pipeline import run_pipeline, plot_both_datasets, plot_dtec_comparison_grid, plot_drm_grid
+
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+# Point this at the folder containing your input files (see the layout
+# described in the module docstring above). Using a single BASE_DIR keeps
+# the rest of the script portable between machines / users — only this
+# line needs to change.
+BASE_DIR = Path("data")
+
+# Reference station used only to *discover* which stations exist in each
+# dataset (see "DISCOVER ALL CANDIDATE REFERENCE STATIONS" below). Any
+# station that is actually present in the RM/TEC/geometry files works here;
+# it does not need to be a "good" reference, since its only job is to let
+# run_pipeline finish once so we can read off the station list.
+DISCOVERY_REF_STATION = "CS002LBA"
+
+# Denominator-rejection threshold passed to solve_T via run_pipeline
+# (see solve_T's `err` parameter). Larger = more aggressive masking of
+# ambiguous (near-degenerate) samples.
+ERR_THRESHOLD = 0.2
+
+# Height (km) at which each dataset's T1/T2 is sliced for plotting.
+HEIGHT_DATASET_1_KM = 200
+HEIGHT_DATASET_2_KM = 350
+COMPARISON_TARGET_HEIGHT_KM = 350
+
+# Which diagnostic figures to generate per reference station. Turn any of
+# these off to speed up the loop while iterating on one type of plot.
+RUN_BOTH_DATASETS_PLOT   = True
+RUN_DTEC_COMPARISON_PLOT = True
+RUN_DRM_PLOT             = True
+
+
+# =========================================================
+# LOAD COMPARISON DATA  (once, outside the loop)
+# =========================================================
+# These are *independent* TEC estimates used only to sanity-check the
+# pipeline's output in the plots below — they never enter run_pipeline.
+#
+#   sTEC_*      : GNSS-derived slant TEC per station, summed over whatever
+#                 extra axis the .npz stores (e.g. satellites/layers), from
+#                 an external tool (here, "spinifex").
+#   TEC_ref1    : a previously-computed 2-D (station, time) reference TEC,
+#                 used to cross-check Dataset 1.
+#   tec_3d_ref2 : a previously-computed height-resolved (station, time,
+#                 height) reference TEC, used to cross-check Dataset 2.
+#
+# Replace the filenames with whatever comparison data you have; the
+# plotting functions treat any of these as optional (pass None to skip).
+
+gnss_data_2020 = np.load(BASE_DIR / "spinifex_gnss_2020_with_rs.npz")
+gnss_data_2024 = np.load(BASE_DIR / "spinifex_gnss_2024_with_rs.npz")
+
+sTEC_2020 = np.sum(gnss_data_2020["wtecs"], axis=-1)
+s2020     = list(gnss_data_2020["stations"])
+sTEC_2024 = np.sum(gnss_data_2024["wtecs"], axis=-1)
+s2024     = list(gnss_data_2024["stations"])
+
+with h5py.File(BASE_DIR / "RM_and_TEC" / "rm_tec_matrix.h5", "r") as f:
+    stations_ref1 = f["stations"][:].astype(str)
+    times_ref1    = f["times"][:].astype(str)
+    TEC_ref1      = f["tec"][:]          # (station, time)
+
+with h5py.File(BASE_DIR / "RM_TEC_HEIGHTSTEPS2" / "tec_height_resolved.h5", "r") as f:
+    stations_ref2 = f["stations"][:].astype(str)
+    times_ref2    = f["times"][:].astype(str)
+    heights_km    = f["heights_km"][:]
+    tec_3d_ref2   = f["tec_3d"][:]      # (station, time, height)
+
+
+# =========================================================
+# DISCOVER ALL CANDIDATE REFERENCE STATIONS
+# =========================================================
+# We only need `stations_ds1`/`stations_ds2` from this call (the station
+# list run_pipeline settled on after intersecting geometry/RM/TEC), so
+# every other return value is discarded with `_`. `DISCOVERY_REF_STATION`
+# just needs to be a station common to all three input files for each
+# dataset — it is not the reference station used for the actual analysis
+# in the main loop below.
+
+_, _, _, _, stations_ds1, _, _, _, _, _, _, _ = run_pipeline(
+    BASE_DIR / "CSC_and_B_HEIGHTSTEPS"  / "geom_and_magnetic.h5",
+    BASE_DIR / "cal-fr.h5",
+    BASE_DIR / "clock_tec_phase0_smooth.npz",
+    tec_is_npz=True, ref_rm=DISCOVERY_REF_STATION, ref_tec=DISCOVERY_REF_STATION,
+    Err=ERR_THRESHOLD,
+    aliases={"SuperSt": "CS002LBA"},  # example: rename a non-standard station label
+)
+_, _, _, _, stations_ds2, _, _, _, _, _, _, _ = run_pipeline(
+    BASE_DIR / "CSC_and_B_HEIGHTSTEPS2" / "geom_and_magnetic.h5",
+    BASE_DIR / "cal-fr2.h5",
+    BASE_DIR / "dtec_fit.npz",
+    tec_is_npz=True, ref_rm=DISCOVERY_REF_STATION, ref_tec=DISCOVERY_REF_STATION,
+    Err=ERR_THRESHOLD,
+)
+
+# Union (not intersection): a station only needs to exist in *one* dataset
+# to be tried as a reference, since run_pipeline for the other dataset is
+# wrapped in its own try/except below and simply skips if that station
+# isn't available there.
+all_stations = sorted(set(stations_ds1) | set(stations_ds2))
+
+
+# =========================================================
+# MAIN LOOP: re-solve with each candidate reference station
+# =========================================================
+for ref_sta in all_stations:
+    print(f"\n{'=' * 60}\n  Reference station: {ref_sta}\n{'=' * 60}")
+
+    ds1 = ds2 = None
+
+    # ---- Dataset 1 ----
+    # run_pipeline raises ValueError if ref_sta isn't present in all three
+    # of Dataset 1's input files (geometry / RM / TEC); that's expected for
+    # some stations (e.g. one only present in Dataset 2), so we skip rather
+    # than abort the whole loop.
+    try:
+        T1, T2, time_hr, heights, stations, B, am, dTEC, dRM, B_ref, am_ref, t0_1 = run_pipeline(
+            BASE_DIR / "CSC_and_B_HEIGHTSTEPS"  / "geom_and_magnetic.h5",
+            BASE_DIR / "cal-fr.h5",
+            BASE_DIR / "clock_tec_phase0_smooth.npz",
+            tec_is_npz=True, ref_rm=ref_sta, ref_tec=ref_sta, Err=ERR_THRESHOLD,
+        )
+        # Package results into the dict shape expected by the plotting
+        # functions in tec_rm_pipeline.py (keys: name, stations, time,
+        # heights, am, B, B_ref, dTEC, dRM, T1, T2, time_origin).
+        ds1 = dict(name=f"Dataset 1 | ref={ref_sta}",
+                   stations=stations, time=time_hr, heights=heights,
+                   am=am, B=B, B_ref=B_ref, dTEC=dTEC, dRM=dRM,
+                   T1=T1, T2=T2, time_origin=t0_1)
+    except ValueError as e:
+        print(f"  [Dataset 1] Skipping: {e}")
+
+    # ---- Dataset 2 ---- (same pattern as Dataset 1, independent try/except
+    # so one dataset failing for this reference station doesn't prevent
+    # plotting the other)
+    try:
+        T1b, T2b, time_hr2, heights2, stations2, B2, am2, dTEC2, dRM2, B_ref2, am_ref2, t0_2 = run_pipeline(
+            BASE_DIR / "CSC_and_B_HEIGHTSTEPS2" / "geom_and_magnetic.h5",
+            BASE_DIR / "cal-fr2.h5",
+            BASE_DIR / "dtec_fit.npz",
+            tec_is_npz=True, ref_rm=ref_sta, ref_tec=ref_sta, Err=ERR_THRESHOLD,
+        )
+        ds2 = dict(name=f"Dataset 2 | ref={ref_sta}",
+                   stations=stations2, time=time_hr2, heights=heights2,
+                   am=am2, B=B2, B_ref=B_ref2, dTEC=dTEC2, dRM=dRM2,
+                   T1=T1b, T2=T2b, time_origin=t0_2)
+    except ValueError as e:
+        print(f"  [Dataset 2] Skipping: {e}")
+
+    # If this reference station worked for neither dataset, there is
+    # nothing to plot — move on to the next candidate.
+    if ds1 is None and ds2 is None:
+        continue
+
+    # ---- Plot 1: T1/T2 vs external comparison data, split by station group ----
+    if RUN_BOTH_DATASETS_PLOT:
+        plot_both_datasets(
+            ds1, ds2, ref_sta, H1=HEIGHT_DATASET_1_KM, H2=HEIGHT_DATASET_2_KM,
+            # Dataset 1 comparison data
+            gnss_stec_1=sTEC_2020, gnss_stations_1=s2020,
+            gnss_times_mjd_1=gnss_data_2020["times"],
+            ref_tec_1=TEC_ref1, ref_stations_1=stations_ref1,
+            ref_times_str_1=times_ref1,
+            # Dataset 2 comparison data
+            gnss_stec_2=sTEC_2024, gnss_stations_2=s2024,
+            gnss_times_mjd_2=gnss_data_2024["times"],
+            ref_tec_3d_2=tec_3d_ref2, ref_stations_2=stations_ref2,
+            ref_times_str_2=times_ref2, ref_heights_km_2=heights_km,
+            target_height=COMPARISON_TARGET_HEIGHT_KM,
+        )
+
+    # ---- Plot 2: per-station dTEC grid vs external comparison data ----
+    if RUN_DTEC_COMPARISON_PLOT:
+        plot_dtec_comparison_grid(
+            ds1, ds2, ref_sta,
+            gnss_stec_1=sTEC_2020, gnss_stations_1=s2020,
+            gnss_times_mjd_1=gnss_data_2020["times"],
+            ref_tec_1=TEC_ref1, ref_stations_1=stations_ref1,
+            ref_times_str_1=times_ref1,
+            gnss_stec_2=sTEC_2024, gnss_stations_2=s2024,
+            gnss_times_mjd_2=gnss_data_2024["times"],
+            ref_tec_3d_2=tec_3d_ref2, ref_stations_2=stations_ref2,
+            ref_times_str_2=times_ref2, ref_heights_km_2=heights_km,
+            target_height=COMPARISON_TARGET_HEIGHT_KM,
+        )
+
+    # ---- Plot 3: per-station differential RM grid (no external comparison) ----
+    if RUN_DRM_PLOT:
+        plot_drm_grid(ds1, ds2, ref_sta)
+
+
+# =========================================================
+# Extending to N datasets
+# =========================================================
+# The pattern above is hard-coded to exactly two datasets because
+# plot_both_datasets/plot_dtec_comparison_grid/plot_drm_grid each take a
+# fixed `ds1, ds2` pair. To generalize to N datasets:
+#   1. Put each dataset's file paths + comparison data into a list of
+#      config dicts instead of separate variables.
+#   2. Replace the two hard-coded try/except blocks with a loop building
+#      a list `datasets = [ds_1, ds_2, ..., ds_N]`.
+#   3. Either call the existing plotting functions pairwise (e.g. once per
+#      consecutive pair), or write an N-row variant of the 2-row grid
+#      layouts in tec_rm_pipeline.py.
