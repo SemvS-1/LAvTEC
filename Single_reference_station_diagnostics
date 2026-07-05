@@ -1,0 +1,350 @@
+"""
+Single-reference-station diagnostics for the TEC / RM pipeline.
+
+This is a simplified companion to run_example.py: instead of looping over
+every candidate reference station, it runs `run_pipeline` exactly once per
+dataset with a *fixed* reference station and produces the diagnostic
+figures used to sanity-check the solved
+absolute TEC:
+
+1. A per-station text summary of how much of T1/T2 survived solve_T's
+   masking (see "VALIDITY CHECK" below).
+2. `plot_B_dB_per_station` — B_parallel and ΔB = B - B_ref vs time, one
+   line per height shell. Useful for spotting *why* a station is poorly
+   constrained: solve_T divides by (airmass * ΔB), so heights/times where
+   ΔB collapses toward zero are exactly where T1/T2 get masked out.
+3. `plot_vtec_height_profiles` — T2 (absolute vTEC) vs time, several
+   height shells overlaid per station, with one "primary" height per
+   dataset highlighted in black. This is the plot that shows whether the
+   solved vTEC profile is physically sensible (smooth, similar magnitude
+   across nearby heights) or degenerate.
+
+Requires Calibration_Pipeline (for `run_pipeline`) alongside this script.
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
+from pathlib import Path
+
+from tec_rm_pipeline import run_pipeline
+
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+BASE_DIR = Path("data")
+
+# One entry per dataset. Each dataset is solved independently with its own
+# fixed reference station — add or remove entries here to change how many
+# datasets are compared (the plotting functions below already support an
+# arbitrary number of datasets, not just two).
+DATASET_CONFIGS = [
+    dict(
+        name="Dataset 1",
+        geom_file=BASE_DIR / "CSC_and_B_HEIGHTSTEPS" / "geom_and_magnetic.h5",
+        rm_file=BASE_DIR / "cal-fr.h5",
+        tec_file=BASE_DIR / "clock_tec_phase0_smooth.npz",
+        tec_is_npz=True,
+        ref_rm="CS002LBA",
+        ref_tec="SuperSt",                       # non-standard label in this dataset's TEC file
+        aliases={"SuperSt": "CS002LBA"},          # ...resolved to the canonical station name
+        Err=0.05,
+        highlight_height_km=200,                  # "primary" height for the vTEC plot
+        y_limit=(0, 20),                          # cap on the vTEC plot's y-axis for this dataset
+    ),
+    dict(
+        name="Dataset 2",
+        geom_file=BASE_DIR / "CSC_and_B_HEIGHTSTEPS2" / "geom_and_magnetic.h5",
+        rm_file=BASE_DIR / "cal-fr2.h5",
+        tec_file=BASE_DIR / "dtec_fit.npz",
+        tec_is_npz=True,
+        ref_rm="CS002LBA",
+        ref_tec="CS002LBA",
+        aliases=None,
+        Err=0.05,
+        highlight_height_km=350,
+        y_limit=(0, 35),
+    ),
+]
+
+# Heights always drawn on the vTEC profile plot regardless of thinning, so
+# the top/bottom of the assumed height range is always visible.
+EDGE_HEIGHTS_KM = (100, 700)
+
+
+# =========================================================
+# RUN THE PIPELINE ONCE PER DATASET
+# =========================================================
+# Each dataset dict below is deliberately the same shape as the ones built
+# in run_example.py's main loop, so it can be passed to any of
+# tec_rm_pipeline.py's plotting functions as well as the two defined here.
+datasets = []
+for cfg in DATASET_CONFIGS:
+    T1, T2, time_hr, heights, stations, B, am, dTEC, dRM, B_ref, am_ref, time_origin = run_pipeline(
+        cfg["geom_file"], cfg["rm_file"], cfg["tec_file"],
+        tec_is_npz=cfg["tec_is_npz"],
+        ref_rm=cfg["ref_rm"], ref_tec=cfg["ref_tec"],
+        Err=cfg["Err"], aliases=cfg["aliases"],
+    )
+    datasets.append(dict(
+        name=cfg["name"], stations=stations, time=time_hr, heights=heights,
+        am=am, B=B, B_ref=B_ref, dTEC=dTEC, dRM=dRM, T1=T1, T2=T2,
+        time_origin=time_origin,
+        highlight_height_km=cfg["highlight_height_km"],
+        y_limit=cfg["y_limit"],
+    ))
+
+
+# =========================================================
+# VALIDITY CHECK
+# =========================================================
+# For each station in each dataset, report what fraction of T1/T2 samples
+# survived solve_T's masking (recall solve_T sets a sample to NaN whenever
+# its denominator (airmass * dB) is too small or the inputs were already
+# NaN). A station with T1/T2 valid fractions near zero across the board
+# usually means: the station's dB never gets big enough relative to the
+# reference for the chosen `Err` threshold, and is not usable with this
+# reference station — that's what the "<-- mostly/all NaN" flag calls out.
+for ds in datasets:
+    print(f"\n=== {ds['name']} ===")
+    T1, T2 = ds["T1"], ds["T2"]
+    for i, s in enumerate(ds["stations"]):
+        frac_valid_T1 = np.mean(np.isfinite(T1[i])) if T1 is not None else np.nan
+        frac_valid_T2 = np.mean(np.isfinite(T2[i])) if T2 is not None else np.nan
+        flag = "  <-- mostly/all NaN" if (frac_valid_T1 < 0.05 and frac_valid_T2 < 0.05) else ""
+        print(f"  {s:12s}  T1 valid={frac_valid_T1:5.1%}  T2 valid={frac_valid_T2:5.1%}{flag}")
+
+
+# =========================================================
+# PLOT 1: B_parallel and ΔB per station, across height shells
+# =========================================================
+
+def plot_B_dB_per_station(datasets, n_height_lines=8):
+    """
+    For every station appearing in any dataset, draw B_parallel(t) and
+    ΔB(t) = B(t) - B_ref(t) at a thinned-out set of height shells.
+
+    One figure per station; one row per dataset that contains that
+    station, two columns (B_parallel | ΔB) unless no dataset provides a
+    reference field, in which case only the B_parallel column is drawn.
+
+    Why this plot matters: solve_T's denominators are proportional to ΔB,
+    so a height/time range where ΔB is flat and close to zero is exactly
+    where that station's T1/T2 get masked out (see the validity check
+    above). This plot lets you see *where* that happens, rather than just
+    the aggregate percentage.
+
+    Parameters
+    ----------
+    datasets : list of dict
+        Each dict must have keys 'name', 'stations', 'time', 'heights',
+        'B' and, optionally, 'B_ref' (pass/leave None to skip the ΔB
+        column for that dataset).
+    n_height_lines : int
+        Approximate number of height shells to draw per subplot; heights
+        are thinned by a fixed stride to avoid an unreadable number of
+        overlapping lines.
+    """
+
+    # Union of station names across all datasets, preserving first-seen order.
+    all_stations = []
+    for ds in datasets:
+        for s in ds["stations"]:
+            if s not in all_stations:
+                all_stations.append(s)
+
+    for s in all_stations:
+        # Only include datasets that actually have this station and a B array.
+        relevant = [ds for ds in datasets if ds["B"] is not None and s in ds["stations"]]
+        if not relevant:
+            continue
+
+        has_dB_any = any(ds["B_ref"] is not None for ds in relevant)
+        ncols = 2 if has_dB_any else 1
+        nrows = len(relevant)
+
+        fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 5 * nrows), squeeze=False)
+
+        for row, ds in enumerate(relevant):
+            time = ds["time"]
+            heights = ds["heights"]
+            i = ds["stations"].index(s)
+
+            # Thin the height axis to at most ~n_height_lines lines per subplot.
+            step = max(1, len(heights) // n_height_lines)
+            h_idx = np.arange(0, len(heights), step)
+            colors = plt.cm.viridis(np.linspace(0, 1, len(h_idx)))
+
+            has_dB = ds["B_ref"] is not None
+
+            # --- B_parallel ---
+            ax = axes[row][0]
+            for c, h in zip(colors, h_idx):
+                ax.plot(time, ds["B"][i, :, h], color=c, label=f"{heights[h]:.0f} km")
+            ax.set_title(f"{ds['name']} — B_parallel", fontsize=16)
+            ax.set_xlabel("Time (hours)", fontsize=14)
+            ax.set_ylabel("B (nT)", fontsize=14)
+            ax.tick_params(axis='both', labelsize=12)
+            ax.legend(fontsize=9, ncol=2, title="Height", title_fontsize=10)
+
+            # --- dB = B - B_ref ---
+            if has_dB:
+                ax = axes[row][1]
+                dB = ds["B"][i] - ds["B_ref"]
+                for c, h in zip(colors, h_idx):
+                    ax.plot(time, dB[:, h], color=c, label=f"{heights[h]:.0f} km")
+                ax.set_title(f"{ds['name']} — ΔB", fontsize=16)
+                ax.set_xlabel("Time (hours)", fontsize=14)
+                ax.set_ylabel("ΔB (nT)", fontsize=14)
+                ax.tick_params(axis='both', labelsize=12)
+                ax.legend(fontsize=9, ncol=2, title="Height", title_fontsize=10)
+            elif ncols == 2:
+                axes[row][1].axis("off")
+
+        fig.suptitle(f"Station: {s}", fontsize=18)
+        fig.tight_layout()
+        plt.show()
+
+
+# =========================================================
+# PLOT 2: vTEC (T2) height profiles per station
+# =========================================================
+
+def _get_line_style(height_km, highlight_height_km, edge_heights, cmap, norm):
+    """
+    Choose colour/linewidth/legend-visibility for one height-shell line in
+    `plot_vtec_height_profiles`.
+
+    Three tiers, checked in order:
+      - the dataset's designated "primary" height -> bold black, labelled
+      - an edge height (top/bottom of the height grid) -> coloured, slightly
+        thicker, labelled
+      - everything else -> coloured, thin, unlabelled (kept off the legend
+        so the legend doesn't get crowded with every thinned height)
+
+    Returns
+    -------
+    color, linewidth, show_in_legend : tuple
+    """
+    is_primary = highlight_height_km is not None and np.isclose(height_km, highlight_height_km)
+    is_edge = any(np.isclose(height_km, e) for e in edge_heights)
+    if is_primary:
+        return "black", 3.0, True
+    elif is_edge:
+        return cmap(norm(height_km)), 2.0, True
+    else:
+        return cmap(norm(height_km)), 1.5, False
+
+
+def _clip_ylim_to_limit(ax, y_limit):
+    """
+    Shrink (never grow) the current y-axis limits of `ax` to fit inside
+    `y_limit = (lo, hi)`, if given. Used to cap runaway autoscaling caused
+    by a few noisy/masked samples, while still letting well-behaved data
+    autoscale normally within that cap.
+    """
+    if y_limit is None:
+        return
+    lo, hi = y_limit
+    cur_lo, cur_hi = ax.get_ylim()
+    new_lo = max(cur_lo, lo) if cur_lo < lo else cur_lo
+    new_hi = min(cur_hi, hi) if cur_hi > hi else cur_hi
+    if new_lo != cur_lo or new_hi != cur_hi:
+        ax.set_ylim(new_lo, new_hi)
+
+
+def plot_vtec_height_profiles(datasets, quantity="T2", n_height_lines=15,
+                              edge_heights_km=EDGE_HEIGHTS_KM, cmap_name="autumn"):
+    """
+    For every station appearing in any dataset, plot the solved absolute
+    vTEC (`quantity`, default "T2") vs time at a thinned-out set of height
+    shells, one subplot per dataset that contains that station.
+
+    This is the "does the solved profile look physical" check: at a given
+    station and time, T at nearby height shells should vary smoothly, and
+    the dataset's designated primary height (`ds["highlight_height_km"]`,
+    set per dataset in DATASET_CONFIGS) is drawn in bold black so it's easy
+    to see how the height actually used for downstream analysis compares
+    to its neighbours.
+
+    Parameters
+    ----------
+    datasets : list of dict
+        Each dict must have keys 'name', 'stations', 'time', 'heights',
+        and `quantity` (e.g. 'T2'), plus the optional 'highlight_height_km'
+        and 'y_limit' set in DATASET_CONFIGS above (missing/None is fine —
+        no height is highlighted / no y-limit is applied).
+    quantity : str
+        Which pipeline output to plot; 'T1' or 'T2'.
+    n_height_lines : int
+        Approximate number of height shells to draw per subplot before
+        edge/primary heights are added back in.
+    edge_heights_km : tuple of float
+        Height(s) always included so the top/bottom of the grid is visible
+        even after thinning.
+    cmap_name : str
+        Matplotlib colormap used for the non-highlighted height lines.
+    """
+
+    cmap = cm.get_cmap(cmap_name)
+    all_heights = np.concatenate([np.asarray(ds["heights"]) for ds in datasets])
+    norm = mcolors.Normalize(vmin=all_heights.min(), vmax=all_heights.max())
+
+    # Union of station names across all datasets, preserving first-seen order.
+    all_stations = []
+    for ds in datasets:
+        for s in ds["stations"]:
+            if s not in all_stations:
+                all_stations.append(s)
+
+    for s in all_stations:
+        relevant = [ds for ds in datasets if s in ds["stations"] and ds[quantity] is not None]
+        if not relevant:
+            continue
+
+        fig, axes = plt.subplots(1, len(relevant), figsize=(6 * len(relevant), 4), squeeze=False)
+        axes = axes[0]
+
+        for col, ds in enumerate(relevant):
+            i = ds["stations"].index(s)
+            time = ds["time"]
+            heights = np.asarray(ds["heights"])
+            highlight_height_km = ds.get("highlight_height_km")
+
+            # Thin the height axis, then always add back the primary height
+            # (if set) and the requested edge heights so they're never
+            # dropped by the stride.
+            step = max(1, len(heights) // n_height_lines)
+            h_idx = np.arange(0, len(heights), step)
+            wanted = list(edge_heights_km) + ([highlight_height_km] if highlight_height_km is not None else [])
+            for target in wanted:
+                match = np.where(np.isclose(heights, target))[0]
+                if len(match) and match[0] not in h_idx:
+                    h_idx = np.sort(np.append(h_idx, match[0]))
+
+            ax = axes[col]
+            for h in h_idx:
+                h_val = heights[h]
+                color, lw, show_label = _get_line_style(h_val, highlight_height_km, edge_heights_km, cmap, norm)
+                label = f"{h_val:.0f} km" if show_label else "_nolegend_"
+                ax.plot(time, ds[quantity][i, :, h], label=label, color=color, linewidth=lw)
+
+            ax.set_title(f"{ds['name']} — vTEC profiles", fontsize=16)
+            ax.set_xlabel("Time (hours)", fontsize=14)
+            ax.set_ylabel("vTEC (TECU)", fontsize=14)
+            ax.tick_params(axis='both', labelsize=12)
+            ax.legend(title="Height", fontsize=9, title_fontsize=10)
+            _clip_ylim_to_limit(ax, ds.get("y_limit"))
+
+        fig.suptitle(f"Station: {s}", fontsize=18)
+        fig.tight_layout()
+        plt.show()
+
+
+# =========================================================
+# RUN
+# =========================================================
+plot_B_dB_per_station(datasets)
+plot_vtec_height_profiles(datasets, quantity="T2")
